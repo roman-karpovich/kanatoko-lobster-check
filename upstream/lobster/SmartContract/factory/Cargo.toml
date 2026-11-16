@@ -1,0 +1,24 @@
+[package]
+name = "lobster-factory"
+description = "Lobster conctract deployer (Soroban)"
+version.workspace = true
+edition = "2021"
+publish = false
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[features]
+default = []
+# Enable to allow privileged ops in tests/dev
+admin = []
+
+[dependencies]
+soroban-sdk = { workspace = true }
+soroban-token-sdk = { workspace = true }
+
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

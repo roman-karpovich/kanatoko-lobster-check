@@ -1,0 +1,12 @@
+[package]
+name = "kanatoko-lobster-deadline-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-only"
+
+[workspace]
+
+[dev-dependencies]
+# Exact source revision is downloaded by prepare.sh; includes the address-collision fix.
+kanatoko = { path = "vendor/kanatoko", features = ["capture"] }

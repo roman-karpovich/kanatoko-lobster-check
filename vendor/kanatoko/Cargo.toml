@@ -1,0 +1,50 @@
+[package]
+name = "kanatoko"
+version = "29.1.1"
+edition = "2021"
+rust-version = "1.91"
+description = "Test Soroban contracts against captured Stellar network state"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/roman-karpovich/kanatoko"
+homepage = "https://github.com/roman-karpovich/kanatoko"
+documentation = "https://docs.rs/kanatoko"
+readme = "README.md"
+keywords = ["stellar", "soroban", "testing", "fork", "smart-contracts"]
+categories = ["development-tools::testing"]
+
+[features]
+default = []
+capture = ["dep:base64", "dep:serde", "dep:serde_json", "dep:ureq"]
+
+[dependencies]
+base64 = { version = "=0.22.1", optional = true }
+serde = { version = "=1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "=1.0.151", optional = true }
+sha2 = "=0.10.9"
+# Keep these major ranges aligned with the Kanatoko release major. soroban-sdk
+# pins its compatible Host patch, so Cargo resolves one shared runtime.
+soroban-env-host = "29"
+soroban-ledger-snapshot = "29"
+soroban-sdk = { version = "29", features = ["testutils"] }
+thiserror = "2"
+ureq = { version = "=2.12.1", default-features = false, features = ["json", "tls"], optional = true }
+
+[[bin]]
+name = "kanatoko"
+path = "tools/kanatoko.rs"
+required-features = ["capture"]
+
+[[example]]
+name = "offline_replay"
+path = "examples/offline_replay.rs"
+required-features = ["capture"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[package.metadata.docs.rs]
+all-features = true

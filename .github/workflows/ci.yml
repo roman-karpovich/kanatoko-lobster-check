@@ -1,0 +1,27 @@
+name: Replay
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +1.95.0 fmt --all -- --check
+      - name: Fetch dependencies
+        run: cargo +1.95.0 fetch --locked
+      - name: Lint the reproduction
+        run: cargo +1.95.0 clippy --locked --offline --all-targets --no-deps -- -D warnings
+      - name: Replay both WASM variants
+        run: ./check.sh --offline

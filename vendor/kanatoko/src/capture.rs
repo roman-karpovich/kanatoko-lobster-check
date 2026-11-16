@@ -1,0 +1,4689 @@
+//! Execution-driven capture of the ledger state a Soroban scenario actually
+//! uses.
+
+use std::{
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{self, Write as _},
+    panic::{catch_unwind, AssertUnwindSafe},
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
+};
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use soroban_env_host::{
+    testutils::call_with_suppressed_panic_hook,
+    xdr::{
+        ConfigSettingEntry, ConfigSettingId, ContractDataDurability, ContractExecutable,
+        ContractExecutableExternalRef, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+        LedgerHeader, LedgerKey, LedgerKeyConfigSetting, LedgerKeyContractCode,
+        LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScErrorCode, ScErrorType, ScVal,
+        StateArchivalSettings, WriteXdr,
+    },
+};
+use soroban_ledger_snapshot::LedgerSnapshot;
+use soroban_sdk::{
+    testutils::{HostError, LedgerInfo, SnapshotSource, SnapshotSourceInput},
+    Address, Env,
+};
+use thiserror::Error;
+
+use crate::{
+    fixture::{executed_protocol_version, ProtocolPolicy, UnsupportedProtocol},
+    runtime::{configure_fork_env, fork_env, ForkEnvSeed},
+    FixtureError, FrozenFixture, StrictFork, SUPPORTED_PROTOCOL_VERSION,
+};
+
+pub(crate) const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+pub(crate) const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+const MAX_COHERENCE_ATTEMPTS: usize = 8;
+const MAX_DISCOVERY_ROUNDS: usize = 16;
+const MAX_EXECUTABLE_CLOSURE_ROUNDS: usize = 16;
+const MAX_KEYS_PER_BATCH: usize = 200;
+const RPC_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
+const RPC_MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
+const CAPTURE_BUNDLE_SCHEMA_VERSION: u32 = 2;
+const INVENTORY_DIGEST_DOMAIN_V1: &[u8] = b"KANATOKO\0CAPTURE-INVENTORY\0V1\0";
+const BUNDLE_DIGEST_DOMAIN_V2: &[u8] = b"KANATOKO\0CAPTURE-BUNDLE\0V2\0";
+const LEGACY_BUNDLE_DIGEST_DOMAIN_V1: &[u8] = b"KANATOKO\0CAPTURE-BUNDLE\0V1\0";
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) type KeyId = Vec<u8>;
+type PresentEntry = (Rc<LedgerEntry>, Option<u32>);
+
+/// Ledger keys explicitly owned by local test setup rather than the captured
+/// network. Each scenario pass gets a fresh registry shared by its facade and
+/// snapshot source.
+#[derive(Default)]
+pub(crate) struct LocalLedger {
+    addresses: RefCell<BTreeSet<ScAddress>>,
+    code_hashes: RefCell<BTreeSet<Hash>>,
+}
+
+impl LocalLedger {
+    pub(crate) fn mark_address(&self, address: ScAddress) {
+        self.addresses.borrow_mut().insert(address);
+    }
+
+    pub(crate) fn mark_code(&self, hash: [u8; 32]) {
+        self.code_hashes.borrow_mut().insert(Hash(hash));
+    }
+
+    fn owns(&self, key: &LedgerKey) -> bool {
+        match key {
+            LedgerKey::ContractCode(code) => self.code_hashes.borrow().contains(&code.hash),
+            LedgerKey::ContractData(data) => self.addresses.borrow().contains(&data.contract),
+            LedgerKey::Account(account) => self
+                .addresses
+                .borrow()
+                .contains(&ScAddress::Account(account.account_id.clone())),
+            LedgerKey::Trustline(trustline) => self
+                .addresses
+                .borrow()
+                .contains(&ScAddress::Account(trustline.account_id.clone())),
+            _ => false,
+        }
+    }
+}
+
+/// Builds an execution-driven, RPC-backed capture.
+///
+/// The URL is held only by the HTTP transport. Debug output and capture
+/// provenance retain only the scheme and hostname/port. Userinfo, path, query,
+/// and fragment are discarded. A credential embedded in the hostname cannot
+/// be recognized and will remain visible, so credentials must not be placed
+/// there.
+pub struct CaptureBuilder {
+    network_passphrase: String,
+    rpc_origin: String,
+    transport: Rc<dyn Transport>,
+    rpc_rate_limiter: Option<Rc<RequestRateLimiter>>,
+    protocol_policy: ProtocolPolicy,
+    max_coherence_attempts: usize,
+    max_discovery_rounds: usize,
+}
+
+impl CaptureBuilder {
+    /// Creates a capture builder for Stellar public mainnet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the URL has no HTTP(S) origin.
+    pub fn mainnet(rpc_url: impl Into<String>) -> Result<Self, CaptureError> {
+        Self::rpc(rpc_url, MAINNET_PASSPHRASE)
+    }
+
+    /// Creates a capture builder for Stellar public testnet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the URL has no HTTP(S) origin.
+    pub fn testnet(rpc_url: impl Into<String>) -> Result<Self, CaptureError> {
+        Self::rpc(rpc_url, TESTNET_PASSPHRASE)
+    }
+
+    /// Creates a capture builder for an explicit RPC network and passphrase.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the URL has no HTTP(S) origin.
+    pub fn rpc(
+        rpc_url: impl Into<String>,
+        network_passphrase: impl Into<String>,
+    ) -> Result<Self, CaptureError> {
+        let rpc_url = rpc_url.into();
+        let rpc_origin = redact_rpc_origin(&rpc_url)?;
+        let rpc_rate_limiter = Rc::new(RequestRateLimiter::new(0));
+        let transport = Rc::new(HttpTransport::new(rpc_url, rpc_rate_limiter.clone()));
+        Ok(Self {
+            network_passphrase: network_passphrase.into(),
+            rpc_origin,
+            transport,
+            rpc_rate_limiter: Some(rpc_rate_limiter),
+            protocol_policy: ProtocolPolicy::Exact,
+            max_coherence_attempts: MAX_COHERENCE_ATTEMPTS,
+            max_discovery_rounds: MAX_DISCOVERY_ROUNDS,
+        })
+    }
+
+    /// Limits read-only RPC requests made by this builder, including retry
+    /// attempts, to at most the supplied requests per second. The default and
+    /// `0` both mean unlimited. Separate builders do not share a quota.
+    #[must_use]
+    pub fn rpc_rate_limit(self, max_requests_per_second: u32) -> Self {
+        if let Some(limiter) = &self.rpc_rate_limiter {
+            limiter.set_requests_per_second(max_requests_per_second);
+        }
+        self
+    }
+
+    /// Opts into capturing a network exactly one ledger protocol newer than
+    /// [`crate::SUPPORTED_PROTOCOL_VERSION`].
+    ///
+    /// The capture stays truthful: provenance, the ledger snapshot, written
+    /// bundles, and every digest keep the real network protocol. Only
+    /// execution is downgraded: each discovery and replay `Env` gives the Host
+    /// [`crate::SUPPORTED_PROTOCOL_VERSION`] as the ledger protocol, reported
+    /// by [`CaptureProvenance::executed_protocol_version`]. Host behaviour that
+    /// changed without an XDR change, such as metering, follows the older
+    /// Host. Contracts built for a newer interface version still fail closed.
+    ///
+    /// The mode only works while the newer protocol keeps the ledger XDR this
+    /// release reads. If the newer protocol changed the ledger header format,
+    /// or a captured ledger entry uses XDR this release cannot decode, capture
+    /// fails with [`CaptureError::UnsupportedProtocol`] for the network's
+    /// protocol; such a network needs the Kanatoko release line for that
+    /// protocol. Older protocols and protocols two or more above the Host are
+    /// rejected with the same error.
+    #[must_use]
+    pub const fn allow_newer_protocol(mut self) -> Self {
+        self.protocol_policy = ProtocolPolicy::AllowNewer;
+        self
+    }
+
+    /// Captures the fixed point of ledger keys touched by `scenario`.
+    ///
+    /// A fresh [`Env`] is supplied on every run, so generated clients and
+    /// addresses must be recreated inside the closure. The closure can run
+    /// several times and must be deterministic, repeatable, and free of
+    /// external side effects. Scenario panics are converted to a terminal error
+    /// only after key discovery stops. Panic output is suppressed during these
+    /// discovery passes.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on network/protocol mismatch, transport or XDR failure,
+    /// incoherent ledger batches, incomplete executable dependencies, a
+    /// terminal scenario panic, or a bounded fixed-point failure.
+    pub fn capture<F>(&self, scenario: F) -> Result<CapturedFixture, CaptureError>
+    where
+        F: Fn(&Env),
+    {
+        self.capture_ref(&|env, _, _| scenario(env))
+    }
+
+    pub(crate) fn capture_with_local<F>(&self, scenario: F) -> Result<CapturedFixture, CaptureError>
+    where
+        F: Fn(&Env, Rc<LocalLedger>, Rc<TrackingSource>),
+    {
+        self.capture_ref(&scenario)
+    }
+
+    pub(crate) fn capture_with_inventory<F>(
+        &self,
+        fixture: &CapturedFixture,
+        scenario: F,
+    ) -> Result<CapturedFixture, CaptureError>
+    where
+        F: Fn(&Env, Rc<LocalLedger>, Rc<TrackingSource>),
+    {
+        self.capture_ref_from_keys(&scenario, fixture.inventory_keys()?)
+    }
+
+    pub(crate) fn cached_anchor_is_current(
+        &self,
+        fixture: &CapturedFixture,
+    ) -> Result<bool, CaptureError> {
+        self.validate_network()?;
+        Ok(self.current_anchor()? == fixture.anchor())
+    }
+
+    fn capture_ref<F>(&self, scenario: &F) -> Result<CapturedFixture, CaptureError>
+    where
+        F: Fn(&Env, Rc<LocalLedger>, Rc<TrackingSource>),
+    {
+        self.capture_ref_from_keys(scenario, BTreeMap::new())
+    }
+
+    fn capture_ref_from_keys<F>(
+        &self,
+        scenario: &F,
+        mut keys: BTreeMap<KeyId, LedgerKey>,
+    ) -> Result<CapturedFixture, CaptureError>
+    where
+        F: Fn(&Env, Rc<LocalLedger>, Rc<TrackingSource>),
+    {
+        self.validate_network()?;
+
+        let mut materialized = self.materialize(&keys)?;
+        materialized = self.expand_code_closure(&mut keys, materialized)?;
+
+        for round in 1..=self.max_discovery_rounds {
+            let local = Rc::new(LocalLedger::default());
+            let source = Rc::new(TrackingSource::rpc_with_local(
+                materialized.coverage.clone(),
+                self.transport.clone(),
+                local.clone(),
+                materialized.ledger_info.protocol_version,
+            ));
+            let env = env_from_materialized(&materialized, source.clone());
+            let outcome = call_with_suppressed_panic_hook(AssertUnwindSafe(|| {
+                scenario(&env, local.clone(), source.clone());
+            }));
+
+            if let Some(failure) = source.take_failure() {
+                return Err(transport_error(
+                    failure,
+                    Some(source.network_protocol_version()),
+                ));
+            }
+
+            let mut requested = source.requested_keys();
+            for (key, _) in env
+                .host()
+                .get_stored_entries()
+                .map_err(|_| CaptureError::HostInspection)?
+            {
+                let key = (*key).clone();
+                if local.owns(&key) {
+                    continue;
+                }
+                requested.insert(key_id(&key)?, key);
+            }
+
+            let mut added = 0_usize;
+            for (_, key) in requested {
+                if is_state_archival_key(&key) {
+                    continue;
+                }
+                let id = key_id(&key)?;
+                if keys.insert(id, key).is_none() {
+                    added += 1;
+                }
+            }
+
+            if added != 0 {
+                materialized = self.materialize(&keys)?;
+                materialized = self.expand_code_closure(&mut keys, materialized)?;
+                continue;
+            }
+
+            if outcome.is_err() {
+                return Err(CaptureError::ScenarioPanicked);
+            }
+            if source.rpc_reads() != 0 {
+                return Err(CaptureError::InternalInvariant);
+            }
+
+            let snapshot = snapshot_from_materialized(&materialized)?;
+            let fixture = FrozenFixture::from_snapshot_with_policy(
+                snapshot,
+                &self.network_passphrase,
+                self.protocol_policy,
+            )?;
+            let inventory_digest = inventory_digest(&materialized.coverage)?;
+            let present_entries = materialized
+                .coverage
+                .values()
+                .filter(|state| matches!(state, LookupState::Present(_, _)))
+                .count();
+            let absent_entries = materialized.coverage.len() - present_entries;
+            let report = CaptureReport {
+                discovery_rounds: round,
+                present_entries,
+                absent_entries,
+                inventory_digest,
+                final_replay_rpc_reads: 0,
+            };
+            let provenance = CaptureProvenance {
+                rpc_origin: self.rpc_origin.clone(),
+                network_passphrase: self.network_passphrase.clone(),
+                ledger_sequence: materialized.anchor.sequence,
+                ledger_hash: materialized.anchor.hash.clone(),
+                protocol_version: materialized.anchor.protocol_version,
+            };
+            return Ok(CapturedFixture {
+                fixture,
+                coverage: materialized.coverage,
+                report,
+                provenance,
+            });
+        }
+
+        Err(CaptureError::FixedPointLimit {
+            rounds: self.max_discovery_rounds,
+        })
+    }
+
+    fn validate_network(&self) -> Result<(), CaptureError> {
+        let network = self
+            .transport
+            .network()
+            .map_err(|failure| transport_error(failure, None))?;
+        if network.passphrase != self.network_passphrase {
+            return Err(CaptureError::NetworkMismatch);
+        }
+        self.protocol_policy.check(network.protocol_version)?;
+        Ok(())
+    }
+
+    fn current_anchor(&self) -> Result<Anchor, CaptureError> {
+        let anchor = self
+            .transport
+            .latest_ledger()
+            .map_err(|failure| transport_error(failure, None))?;
+        self.protocol_policy.check(anchor.protocol_version)?;
+        Ok(anchor)
+    }
+
+    fn materialize(&self, keys: &BTreeMap<KeyId, LedgerKey>) -> Result<Materialized, CaptureError> {
+        let config_key = state_archival_key();
+        let config_id = key_id(&config_key)?;
+        let mut requested = keys.clone();
+        requested.insert(config_id.clone(), config_key);
+        let requested: Vec<(KeyId, LedgerKey)> = requested.into_iter().collect();
+
+        for _ in 0..self.max_coherence_attempts {
+            let before = self
+                .transport
+                .latest_ledger()
+                .map_err(|failure| transport_error(failure, None))?;
+            self.protocol_policy.check(before.protocol_version)?;
+
+            let mut coverage = BTreeMap::new();
+            let mut archival = None;
+            let mut batches_match = true;
+            for chunk in requested.chunks(MAX_KEYS_PER_BATCH) {
+                let batch_keys: Vec<LedgerKey> = chunk.iter().map(|(_, key)| key.clone()).collect();
+                let batch = self
+                    .transport
+                    .ledger_entries(&batch_keys)
+                    .map_err(|failure| transport_error(failure, Some(before.protocol_version)))?;
+                if batch.latest_ledger != before.sequence {
+                    batches_match = false;
+                    break;
+                }
+                let returned = validate_batch(&batch_keys, batch.entries)?;
+                for (id, key) in chunk {
+                    let value = returned.get(id).cloned();
+                    if id == &config_id {
+                        archival = Some(extract_archival(value.as_ref())?);
+                    } else {
+                        coverage.insert(
+                            id.clone(),
+                            value.map_or(LookupState::Absent, |entry| {
+                                LookupState::Present(entry.entry, entry.live_until)
+                            }),
+                        );
+                    }
+                    debug_assert_eq!(id, &key_id(key)?);
+                }
+            }
+
+            let after = self
+                .transport
+                .latest_ledger()
+                .map_err(|failure| transport_error(failure, None))?;
+            if !batches_match || before != after {
+                continue;
+            }
+            let archival = archival.ok_or(CaptureError::MissingStateArchival)?;
+            validate_coverage(&coverage, before.sequence, archival.max_entry_ttl)?;
+            let ledger_info = LedgerInfo {
+                protocol_version: before.protocol_version,
+                sequence_number: before.sequence,
+                timestamp: before.timestamp,
+                network_id: Sha256::digest(self.network_passphrase.as_bytes()).into(),
+                base_reserve: before.base_reserve,
+                min_persistent_entry_ttl: archival.min_persistent_ttl,
+                min_temp_entry_ttl: archival.min_temporary_ttl,
+                max_entry_ttl: archival.max_entry_ttl,
+            };
+            return Ok(Materialized {
+                anchor: before,
+                ledger_info,
+                coverage,
+            });
+        }
+
+        Err(CaptureError::IncoherentLedger {
+            attempts: self.max_coherence_attempts,
+        })
+    }
+
+    fn expand_code_closure(
+        &self,
+        keys: &mut BTreeMap<KeyId, LedgerKey>,
+        mut materialized: Materialized,
+    ) -> Result<Materialized, CaptureError> {
+        for round in 0..=MAX_EXECUTABLE_CLOSURE_ROUNDS {
+            let mut required = Vec::new();
+            for state in materialized.coverage.values() {
+                let LookupState::Present(entry, _) = state else {
+                    continue;
+                };
+                let LedgerEntryData::ContractData(data) = &entry.data else {
+                    continue;
+                };
+                let ScVal::ContractInstance(instance) = &data.val else {
+                    continue;
+                };
+                match &instance.executable {
+                    ContractExecutable::Wasm(hash) => {
+                        required.push(LedgerKey::ContractCode(LedgerKeyContractCode {
+                            hash: hash.clone(),
+                        }));
+                    }
+                    ContractExecutable::ExternalRef(external_ref) => {
+                        required.push(executable_ref_key(external_ref));
+                        if let Some(code_key) =
+                            external_ref_code_key(&materialized.coverage, external_ref)?
+                        {
+                            required.push(code_key);
+                        }
+                    }
+                    ContractExecutable::StellarAsset => {}
+                }
+            }
+
+            let mut added = false;
+            for key in required {
+                let id = key_id(&key)?;
+                if keys.insert(id, key).is_none() {
+                    added = true;
+                }
+            }
+            if !added {
+                ensure_executable_closure_present(&materialized.coverage)?;
+                return Ok(materialized);
+            }
+            if round < MAX_EXECUTABLE_CLOSURE_ROUNDS {
+                materialized = self.materialize(keys)?;
+            }
+        }
+
+        Err(CaptureError::ExecutableClosureLimit {
+            rounds: MAX_EXECUTABLE_CLOSURE_ROUNDS,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_transport(transport: Rc<dyn Transport>, network_passphrase: impl Into<String>) -> Self {
+        Self {
+            network_passphrase: network_passphrase.into(),
+            rpc_origin: "https://fake.invalid".to_string(),
+            transport,
+            rpc_rate_limiter: None,
+            protocol_policy: ProtocolPolicy::Exact,
+            max_coherence_attempts: MAX_COHERENCE_ATTEMPTS,
+            max_discovery_rounds: MAX_DISCOVERY_ROUNDS,
+        }
+    }
+}
+
+impl fmt::Debug for CaptureBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CaptureBuilder")
+            .field("rpc_origin", &self.rpc_origin)
+            .field("max_coherence_attempts", &self.max_coherence_attempts)
+            .field("max_discovery_rounds", &self.max_discovery_rounds)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A coherent starting state plus strict Present/Absent coverage.
+#[derive(Clone, Debug)]
+pub struct CapturedFixture {
+    fixture: FrozenFixture,
+    coverage: BTreeMap<KeyId, LookupState>,
+    report: CaptureReport,
+    provenance: CaptureProvenance,
+}
+
+impl CapturedFixture {
+    /// Returns the validated frozen ledger snapshot.
+    #[must_use]
+    pub const fn frozen_fixture(&self) -> &FrozenFixture {
+        &self.fixture
+    }
+
+    /// Returns capture counts, fixed-point rounds, and inventory digest.
+    #[must_use]
+    pub const fn report(&self) -> &CaptureReport {
+        &self.report
+    }
+
+    /// Returns capture provenance with RPC userinfo/path/query removed.
+    ///
+    /// The hostname is retained verbatim and must not contain credentials.
+    #[must_use]
+    pub const fn provenance(&self) -> &CaptureProvenance {
+        &self.provenance
+    }
+
+    /// Iterates canonical XDR keys proven absent at the captured ledger.
+    pub fn known_absent_keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.coverage.iter().filter_map(|(key, state)| {
+            matches!(state, LookupState::Absent).then_some(key.as_slice())
+        })
+    }
+
+    /// Atomically writes a versioned, self-validating capture bundle.
+    ///
+    /// The temporary file is created and synced in the destination directory,
+    /// then renamed over `path`. The separate frozen ledger snapshot format is
+    /// not changed by this API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bundle cannot be encoded, written, synced, or
+    /// atomically renamed.
+    pub fn write_file(&self, path: impl AsRef<Path>) -> Result<(), CaptureError> {
+        let bundle = self.to_bundle()?;
+        let bytes =
+            serde_json::to_vec_pretty(&bundle).map_err(|_| CaptureError::MalformedCaptureBundle)?;
+        atomic_write(path.as_ref(), &bytes)
+    }
+
+    /// Reads and validates a versioned capture bundle before constructing an
+    /// offline replay fixture.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on I/O or JSON errors, an unsupported schema, a network or
+    /// protocol mismatch, malformed XDR, changed canonical digests, inconsistent
+    /// Present/Absent coverage, or incomplete executable dependencies.
+    pub fn from_file(
+        path: impl AsRef<Path>,
+        expected_network_passphrase: &str,
+    ) -> Result<Self, CaptureError> {
+        Self::from_file_with_policy(path, expected_network_passphrase, ProtocolPolicy::Exact)
+    }
+
+    /// Like [`Self::from_file`], but also accepts a bundle captured exactly
+    /// one ledger protocol newer than [`crate::SUPPORTED_PROTOCOL_VERSION`].
+    ///
+    /// The bundle is validated exactly as recorded, including its network
+    /// protocol and digests. Replays and forks execute it on the Host as
+    /// [`crate::SUPPORTED_PROTOCOL_VERSION`]; see
+    /// [`CaptureBuilder::allow_newer_protocol`] for what can differ. A bundle
+    /// holds no ledger header, so a newer header format does not prevent
+    /// loading it; ledger entries this release cannot decode still fail
+    /// closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors documented by [`Self::from_file`]. Protocols older
+    /// than [`crate::SUPPORTED_PROTOCOL_VERSION`] and protocols two or more
+    /// above it are still rejected with [`FixtureError::UnsupportedProtocol`].
+    pub fn from_file_allowing_newer_protocol(
+        path: impl AsRef<Path>,
+        expected_network_passphrase: &str,
+    ) -> Result<Self, CaptureError> {
+        Self::from_file_with_policy(
+            path,
+            expected_network_passphrase,
+            ProtocolPolicy::AllowNewer,
+        )
+    }
+
+    pub(crate) fn from_file_with_policy(
+        path: impl AsRef<Path>,
+        expected_network_passphrase: &str,
+        policy: ProtocolPolicy,
+    ) -> Result<Self, CaptureError> {
+        let bytes = fs::read(path.as_ref()).map_err(|source| CaptureError::CaptureBundleIo {
+            operation: "read",
+            source,
+        })?;
+        Self::from_bundle_bytes(&bytes, expected_network_passphrase, policy)
+    }
+
+    /// Replays once with strict unknown-key rejection and no RPC transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError::UnknownLedgerKeys`] if the scenario touches a
+    /// key outside captured Present/Absent coverage, or
+    /// [`CaptureError::ScenarioPanicked`] for any other contained panic. The
+    /// standard Rust panic hook still runs and can print the payload; never put
+    /// secrets in scenario panic messages.
+    pub fn replay<F, R>(&self, scenario: F) -> Result<R, CaptureError>
+    where
+        F: FnOnce(&Env) -> R,
+    {
+        self.replay_with_local(|env, _, _| scenario(env))
+    }
+
+    pub(crate) fn replay_with_local<F, R>(&self, scenario: F) -> Result<R, CaptureError>
+    where
+        F: FnOnce(&Env, Rc<LocalLedger>, Rc<TrackingSource>) -> R,
+    {
+        let materialized = Materialized {
+            anchor: Anchor {
+                sequence: self.fixture.ledger_snapshot().sequence_number,
+                hash: self.provenance.ledger_hash.clone(),
+                protocol_version: self.fixture.ledger_snapshot().protocol_version,
+                timestamp: self.fixture.ledger_snapshot().timestamp,
+                base_reserve: self.fixture.ledger_snapshot().base_reserve,
+            },
+            ledger_info: self.fixture.ledger_snapshot().ledger_info(),
+            coverage: self.coverage.clone(),
+        };
+        let local = Rc::new(LocalLedger::default());
+        let source = Rc::new(TrackingSource::strict_with_local(
+            self.coverage.clone(),
+            local.clone(),
+            materialized.ledger_info.protocol_version,
+        ));
+        let env = env_from_materialized(&materialized, source.clone());
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            scenario(&env, local.clone(), source.clone())
+        }));
+
+        let mut unknown = source.unknown_keys();
+        for (key, _) in env
+            .host()
+            .get_stored_entries()
+            .map_err(|_| CaptureError::HostInspection)?
+        {
+            if local.owns(&key) {
+                continue;
+            }
+            let id = key_id(&key)?;
+            if !self.coverage.contains_key(&id) {
+                unknown.insert(id);
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(CaptureError::UnknownLedgerKeys {
+                count: unknown.len(),
+            });
+        }
+        outcome.map_err(|_| CaptureError::ScenarioPanicked)
+    }
+
+    fn inventory_keys(&self) -> Result<BTreeMap<KeyId, LedgerKey>, CaptureError> {
+        self.coverage
+            .keys()
+            .map(|id| {
+                let key = LedgerKey::from_xdr(id.clone(), Limits::none())
+                    .map_err(|_| CaptureError::MalformedCaptureBundle)?;
+                if key_id(&key)? != *id || is_state_archival_key(&key) {
+                    return Err(CaptureError::MalformedCaptureBundle);
+                }
+                Ok((id.clone(), key))
+            })
+            .collect()
+    }
+
+    fn anchor(&self) -> Anchor {
+        Anchor {
+            sequence: self.fixture.ledger_snapshot().sequence_number,
+            hash: self.provenance.ledger_hash.clone(),
+            protocol_version: self.fixture.ledger_snapshot().protocol_version,
+            timestamp: self.fixture.ledger_snapshot().timestamp,
+            base_reserve: self.fixture.ledger_snapshot().base_reserve,
+        }
+    }
+
+    /// Creates an offline mutable fork that retains strict Present/Absent
+    /// coverage. Keys outside that inventory fail closed after every preview,
+    /// applied invocation, mutation, and revert.
+    #[must_use]
+    pub fn fork(&self) -> StrictFork {
+        StrictFork::from_captured(self.fixture.ledger_snapshot(), self.coverage.clone())
+    }
+
+    fn to_bundle(&self) -> Result<CaptureBundleV2, CaptureError> {
+        let known_absent: Vec<String> = self
+            .known_absent_keys()
+            .map(|key| BASE64.encode(key))
+            .collect();
+        let ledger_digest = self.fixture.ledger_digest();
+        let inventory_digest = inventory_digest(&self.coverage)?;
+        if inventory_digest != self.report.inventory_digest {
+            return Err(CaptureError::InternalInvariant);
+        }
+        let report = BundleReport {
+            discovery_rounds: u32::try_from(self.report.discovery_rounds)
+                .map_err(|_| CaptureError::InternalInvariant)?,
+            present_entries: u64::try_from(self.report.present_entries)
+                .map_err(|_| CaptureError::InternalInvariant)?,
+            absent_entries: u64::try_from(self.report.absent_entries)
+                .map_err(|_| CaptureError::InternalInvariant)?,
+            final_replay_rpc_reads: self.report.final_replay_rpc_reads,
+        };
+        let provenance = BundleProvenance {
+            rpc_origin: self.provenance.rpc_origin.clone(),
+            network_passphrase: self.provenance.network_passphrase.clone(),
+            ledger_sequence: self.provenance.ledger_sequence,
+            ledger_hash: self.provenance.ledger_hash.clone(),
+            protocol_version: self.provenance.protocol_version,
+        };
+        let canonical_digest = canonical_bundle_digest(
+            &known_absent,
+            &report,
+            &provenance,
+            &ledger_digest,
+            &inventory_digest,
+        )?;
+        Ok(CaptureBundleV2 {
+            schema_version: CAPTURE_BUNDLE_SCHEMA_VERSION,
+            ledger_snapshot: self.fixture.ledger_snapshot().clone(),
+            known_absent,
+            report,
+            provenance,
+            ledger_digest: hex(ledger_digest),
+            inventory_digest: hex(inventory_digest),
+            canonical_digest: hex(canonical_digest),
+        })
+    }
+
+    fn from_bundle(
+        bundle: CaptureBundleV2,
+        expected_network_passphrase: &str,
+        policy: ProtocolPolicy,
+    ) -> Result<Self, CaptureError> {
+        let digests = validate_bundle_envelope(&bundle, expected_network_passphrase)?;
+        let fixture = FrozenFixture::from_snapshot_with_policy(
+            bundle.ledger_snapshot,
+            expected_network_passphrase,
+            policy,
+        )?;
+        if fixture.ledger_digest() != digests.ledger {
+            return Err(CaptureError::CaptureBundleIntegrity);
+        }
+
+        let coverage = bundle_coverage(fixture.ledger_snapshot(), &bundle.known_absent)?;
+        let (present_entries, absent_entries) = validate_bundle_coverage(
+            &coverage,
+            &bundle.report,
+            &digests.inventory,
+            fixture.ledger_snapshot().sequence_number,
+            fixture.ledger_snapshot().max_entry_ttl,
+        )?;
+
+        let report = CaptureReport {
+            discovery_rounds: usize::try_from(bundle.report.discovery_rounds)
+                .map_err(|_| CaptureError::MalformedCaptureBundle)?,
+            present_entries,
+            absent_entries,
+            inventory_digest: digests.inventory,
+            final_replay_rpc_reads: 0,
+        };
+        let provenance = CaptureProvenance {
+            rpc_origin: bundle.provenance.rpc_origin,
+            network_passphrase: bundle.provenance.network_passphrase,
+            ledger_sequence: bundle.provenance.ledger_sequence,
+            ledger_hash: bundle.provenance.ledger_hash,
+            protocol_version: bundle.provenance.protocol_version,
+        };
+        Ok(Self {
+            fixture,
+            coverage,
+            report,
+            provenance,
+        })
+    }
+
+    fn from_bundle_bytes(
+        bytes: &[u8],
+        expected_network_passphrase: &str,
+        policy: ProtocolPolicy,
+    ) -> Result<Self, CaptureError> {
+        let version: BundleVersion =
+            serde_json::from_slice(bytes).map_err(|_| CaptureError::MalformedCaptureBundle)?;
+        match version.schema_version {
+            CAPTURE_BUNDLE_SCHEMA_VERSION => {
+                let bundle: CaptureBundleV2 = serde_json::from_slice(bytes)
+                    .map_err(|_| CaptureError::MalformedCaptureBundle)?;
+                Self::from_bundle(bundle, expected_network_passphrase, policy)
+            }
+            1 => {
+                let bundle: LegacyCaptureBundleV1 = serde_json::from_slice(bytes)
+                    .map_err(|_| CaptureError::MalformedCaptureBundle)?;
+                Self::from_legacy_bundle(bundle, expected_network_passphrase, policy)
+            }
+            found => Err(CaptureError::UnsupportedCaptureBundleSchema {
+                found,
+                supported: CAPTURE_BUNDLE_SCHEMA_VERSION,
+            }),
+        }
+    }
+
+    fn from_legacy_bundle(
+        bundle: LegacyCaptureBundleV1,
+        expected_network_passphrase: &str,
+        policy: ProtocolPolicy,
+    ) -> Result<Self, CaptureError> {
+        let digests = validate_legacy_bundle_envelope(&bundle, expected_network_passphrase)?;
+        let fixture = FrozenFixture::from_snapshot_with_policy(
+            bundle.ledger_snapshot,
+            expected_network_passphrase,
+            policy,
+        )?;
+        if fixture.ledger_digest() != digests.ledger {
+            return Err(CaptureError::CaptureBundleIntegrity);
+        }
+
+        let root = parse_legacy_contract_address(&bundle.root_contract)?;
+        let coverage = bundle_coverage(fixture.ledger_snapshot(), &bundle.known_absent)?;
+        ensure_legacy_root_present(&root, &coverage)
+            .map_err(|_| CaptureError::CaptureBundleIntegrity)?;
+        let (present_entries, absent_entries) = validate_bundle_coverage(
+            &coverage,
+            &bundle.report,
+            &digests.inventory,
+            fixture.ledger_snapshot().sequence_number,
+            fixture.ledger_snapshot().max_entry_ttl,
+        )?;
+
+        let report = CaptureReport {
+            discovery_rounds: usize::try_from(bundle.report.discovery_rounds)
+                .map_err(|_| CaptureError::MalformedCaptureBundle)?,
+            present_entries,
+            absent_entries,
+            inventory_digest: digests.inventory,
+            final_replay_rpc_reads: 0,
+        };
+        let provenance = CaptureProvenance {
+            rpc_origin: bundle.provenance.rpc_origin,
+            network_passphrase: bundle.provenance.network_passphrase,
+            ledger_sequence: bundle.provenance.ledger_sequence,
+            ledger_hash: bundle.provenance.ledger_hash,
+            protocol_version: bundle.provenance.protocol_version,
+        };
+        Ok(Self {
+            fixture,
+            coverage,
+            report,
+            provenance,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct BundleVersion {
+    schema_version: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureBundleV2 {
+    schema_version: u32,
+    ledger_snapshot: LedgerSnapshot,
+    known_absent: Vec<String>,
+    report: BundleReport,
+    provenance: BundleProvenance,
+    ledger_digest: String,
+    inventory_digest: String,
+    canonical_digest: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCaptureBundleV1 {
+    schema_version: u32,
+    root_contract: String,
+    ledger_snapshot: LedgerSnapshot,
+    known_absent: Vec<String>,
+    report: BundleReport,
+    provenance: BundleProvenance,
+    ledger_digest: String,
+    inventory_digest: String,
+    canonical_digest: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundleReport {
+    discovery_rounds: u32,
+    present_entries: u64,
+    absent_entries: u64,
+    final_replay_rpc_reads: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundleProvenance {
+    rpc_origin: String,
+    network_passphrase: String,
+    ledger_sequence: u32,
+    ledger_hash: String,
+    protocol_version: u32,
+}
+
+struct BundleDigests {
+    ledger: [u8; 32],
+    inventory: [u8; 32],
+}
+
+fn validate_bundle_envelope(
+    bundle: &CaptureBundleV2,
+    expected_network_passphrase: &str,
+) -> Result<BundleDigests, CaptureError> {
+    if bundle.schema_version != CAPTURE_BUNDLE_SCHEMA_VERSION {
+        return Err(CaptureError::UnsupportedCaptureBundleSchema {
+            found: bundle.schema_version,
+            supported: CAPTURE_BUNDLE_SCHEMA_VERSION,
+        });
+    }
+    validate_bundle_metadata(
+        &bundle.ledger_snapshot,
+        &bundle.report,
+        &bundle.provenance,
+        expected_network_passphrase,
+    )?;
+
+    let ledger = decode_hex_digest(&bundle.ledger_digest)?;
+    let inventory = decode_hex_digest(&bundle.inventory_digest)?;
+    let actual_canonical = decode_hex_digest(&bundle.canonical_digest)?;
+    let expected_canonical = canonical_bundle_digest(
+        &bundle.known_absent,
+        &bundle.report,
+        &bundle.provenance,
+        &ledger,
+        &inventory,
+    )?;
+    if actual_canonical != expected_canonical {
+        return Err(CaptureError::CaptureBundleIntegrity);
+    }
+    Ok(BundleDigests { ledger, inventory })
+}
+
+fn validate_bundle_metadata(
+    ledger_snapshot: &LedgerSnapshot,
+    report: &BundleReport,
+    provenance: &BundleProvenance,
+    expected_network_passphrase: &str,
+) -> Result<(), CaptureError> {
+    if provenance.network_passphrase != expected_network_passphrase {
+        return Err(CaptureError::NetworkMismatch);
+    }
+    if redact_rpc_origin(&provenance.rpc_origin)? != provenance.rpc_origin {
+        return Err(CaptureError::MalformedCaptureBundle);
+    }
+    let discovery_rounds = usize::try_from(report.discovery_rounds)
+        .map_err(|_| CaptureError::MalformedCaptureBundle)?;
+    if provenance.ledger_sequence != ledger_snapshot.sequence_number
+        || provenance.protocol_version != ledger_snapshot.protocol_version
+        || provenance.ledger_hash.is_empty()
+        || discovery_rounds == 0
+        || discovery_rounds > MAX_DISCOVERY_ROUNDS
+        || report.final_replay_rpc_reads != 0
+    {
+        return Err(CaptureError::CaptureBundleIntegrity);
+    }
+    Ok(())
+}
+
+fn validate_legacy_bundle_envelope(
+    bundle: &LegacyCaptureBundleV1,
+    expected_network_passphrase: &str,
+) -> Result<BundleDigests, CaptureError> {
+    if bundle.schema_version != 1 {
+        return Err(CaptureError::UnsupportedCaptureBundleSchema {
+            found: bundle.schema_version,
+            supported: CAPTURE_BUNDLE_SCHEMA_VERSION,
+        });
+    }
+    validate_bundle_metadata(
+        &bundle.ledger_snapshot,
+        &bundle.report,
+        &bundle.provenance,
+        expected_network_passphrase,
+    )?;
+
+    let ledger = decode_hex_digest(&bundle.ledger_digest)?;
+    let inventory = decode_hex_digest(&bundle.inventory_digest)?;
+    let actual_canonical = decode_hex_digest(&bundle.canonical_digest)?;
+    let expected_canonical = legacy_canonical_bundle_digest(
+        &bundle.root_contract,
+        &bundle.known_absent,
+        &bundle.report,
+        &bundle.provenance,
+        &ledger,
+        &inventory,
+    )?;
+    if actual_canonical != expected_canonical {
+        return Err(CaptureError::CaptureBundleIntegrity);
+    }
+    Ok(BundleDigests { ledger, inventory })
+}
+
+fn bundle_coverage(
+    snapshot: &LedgerSnapshot,
+    known_absent: &[String],
+) -> Result<BTreeMap<KeyId, LookupState>, CaptureError> {
+    let mut coverage = BTreeMap::new();
+    for (_, (entry, live_until)) in &snapshot.ledger_entries {
+        let key = entry.to_key();
+        if is_state_archival_key(&key) {
+            return Err(CaptureError::MalformedCaptureBundle);
+        }
+        let id = key_id(&key)?;
+        if coverage
+            .insert(
+                id,
+                LookupState::Present(Rc::new((**entry).clone()), *live_until),
+            )
+            .is_some()
+        {
+            return Err(CaptureError::CaptureBundleIntegrity);
+        }
+    }
+
+    let mut previous_absent = None;
+    for encoded in known_absent {
+        let bytes = BASE64
+            .decode(encoded)
+            .map_err(|_| CaptureError::MalformedCaptureBundle)?;
+        if BASE64.encode(&bytes) != *encoded {
+            return Err(CaptureError::MalformedCaptureBundle);
+        }
+        let key = LedgerKey::from_xdr(bytes.clone(), Limits::none())
+            .map_err(|_| CaptureError::MalformedCaptureBundle)?;
+        if key_id(&key)? != bytes || is_state_archival_key(&key) {
+            return Err(CaptureError::MalformedCaptureBundle);
+        }
+        if previous_absent
+            .as_ref()
+            .is_some_and(|previous| previous >= &bytes)
+        {
+            return Err(CaptureError::MalformedCaptureBundle);
+        }
+        previous_absent = Some(bytes.clone());
+        if coverage.insert(bytes, LookupState::Absent).is_some() {
+            return Err(CaptureError::CaptureBundleIntegrity);
+        }
+    }
+    Ok(coverage)
+}
+
+fn validate_bundle_coverage(
+    coverage: &BTreeMap<KeyId, LookupState>,
+    report: &BundleReport,
+    expected_inventory_digest: &[u8; 32],
+    ledger_sequence: u32,
+    max_entry_ttl: u32,
+) -> Result<(usize, usize), CaptureError> {
+    if validate_coverage(coverage, ledger_sequence, max_entry_ttl).is_err()
+        || ensure_executable_closure_present(coverage).is_err()
+    {
+        return Err(CaptureError::CaptureBundleIntegrity);
+    }
+    let present_entries = coverage
+        .values()
+        .filter(|state| matches!(state, LookupState::Present(_, _)))
+        .count();
+    let absent_entries = coverage.len() - present_entries;
+    if inventory_digest(coverage)? != *expected_inventory_digest
+        || u64::try_from(present_entries).ok() != Some(report.present_entries)
+        || u64::try_from(absent_entries).ok() != Some(report.absent_entries)
+    {
+        return Err(CaptureError::CaptureBundleIntegrity);
+    }
+    Ok((present_entries, absent_entries))
+}
+
+/// Stable capture summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureReport {
+    discovery_rounds: usize,
+    present_entries: usize,
+    absent_entries: usize,
+    inventory_digest: [u8; 32],
+    final_replay_rpc_reads: u64,
+}
+
+impl CaptureReport {
+    #[must_use]
+    pub const fn discovery_rounds(&self) -> usize {
+        self.discovery_rounds
+    }
+
+    #[must_use]
+    pub const fn present_entries(&self) -> usize {
+        self.present_entries
+    }
+
+    #[must_use]
+    pub const fn absent_entries(&self) -> usize {
+        self.absent_entries
+    }
+
+    #[must_use]
+    pub const fn inventory_digest(&self) -> [u8; 32] {
+        self.inventory_digest
+    }
+
+    #[must_use]
+    pub const fn final_replay_rpc_reads(&self) -> u64 {
+        self.final_replay_rpc_reads
+    }
+}
+
+/// Source origin and ledger provenance.
+///
+/// RPC userinfo/path/query are removed, while hostname/port remain verbatim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureProvenance {
+    rpc_origin: String,
+    network_passphrase: String,
+    ledger_sequence: u32,
+    ledger_hash: String,
+    protocol_version: u32,
+}
+
+impl CaptureProvenance {
+    #[must_use]
+    pub fn rpc_origin(&self) -> &str {
+        &self.rpc_origin
+    }
+
+    #[must_use]
+    pub fn network_passphrase(&self) -> &str {
+        &self.network_passphrase
+    }
+
+    #[must_use]
+    pub const fn ledger_sequence(&self) -> u32 {
+        self.ledger_sequence
+    }
+
+    #[must_use]
+    pub fn ledger_hash(&self) -> &str {
+        &self.ledger_hash
+    }
+
+    /// Ledger protocol of the network at the captured ledger.
+    ///
+    /// This is always the real network protocol, also under the opt-in
+    /// newer-protocol mode.
+    #[must_use]
+    pub const fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    /// Ledger protocol the Host executes this capture with.
+    ///
+    /// It equals [`Self::protocol_version`] except for a capture exactly one
+    /// protocol newer than [`crate::SUPPORTED_PROTOCOL_VERSION`], accepted
+    /// through [`CaptureBuilder::allow_newer_protocol`] or
+    /// [`CapturedFixture::from_file_allowing_newer_protocol`], which executes
+    /// as [`crate::SUPPORTED_PROTOCOL_VERSION`].
+    #[must_use]
+    pub const fn executed_protocol_version(&self) -> u32 {
+        executed_protocol_version(self.protocol_version)
+    }
+}
+
+/// Fail-closed capture and strict replay errors.
+#[derive(Debug, Error)]
+pub enum CaptureError {
+    #[error("RPC URL must contain an http(s) origin")]
+    InvalidRpcUrl,
+    #[error("RPC network passphrase does not match the requested network")]
+    NetworkMismatch,
+    #[error(
+        "ledger protocol {found} is not supported by this Kanatoko release (Host protocol \
+         {supported}); use the Kanatoko release line for protocol {found}"
+    )]
+    UnsupportedProtocol { found: u32, supported: u32 },
+    #[error("RPC transport failed during {operation}")]
+    Transport { operation: &'static str },
+    #[error("RPC returned malformed data during {operation}")]
+    MalformedRpc { operation: &'static str },
+    #[error("could not materialize one coherent ledger after {attempts} attempts")]
+    IncoherentLedger { attempts: usize },
+    #[error("StateArchival config was absent from a coherent ledger")]
+    MissingStateArchival,
+    #[error("captured contract instance references an absent executable reference")]
+    MissingExecutableReference,
+    #[error("captured executable reference does not contain a 32-byte WASM hash")]
+    MalformedExecutableReference,
+    #[error("captured contract executable references absent WASM code")]
+    MissingReferencedCode,
+    #[error("executable closure did not reach a fixed point in {rounds} rounds")]
+    ExecutableClosureLimit { rounds: usize },
+    #[error("scenario panicked after reaching a ledger-key fixed point")]
+    ScenarioPanicked,
+    #[error("scenario did not reach a ledger-key fixed point in {rounds} rounds")]
+    FixedPointLimit { rounds: usize },
+    #[error("strict replay touched {count} unknown ledger key(s)")]
+    UnknownLedgerKeys { count: usize },
+    #[error("capture bundle I/O failed during {operation}")]
+    CaptureBundleIo {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("capture bundle schema {found} is unsupported; expected {supported}")]
+    UnsupportedCaptureBundleSchema { found: u32, supported: u32 },
+    #[error("capture bundle is malformed")]
+    MalformedCaptureBundle,
+    #[error("capture bundle integrity validation failed")]
+    CaptureBundleIntegrity,
+    #[error("Host ledger inspection failed")]
+    HostInspection,
+    #[error("capture internal invariant failed")]
+    InternalInvariant,
+    #[error(transparent)]
+    Fixture(#[from] FixtureError),
+    #[error("ledger XDR encoding failed")]
+    Xdr,
+}
+
+impl From<UnsupportedProtocol> for CaptureError {
+    fn from(error: UnsupportedProtocol) -> Self {
+        Self::UnsupportedProtocol {
+            found: error.found,
+            supported: error.supported,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LookupState {
+    Present(Rc<LedgerEntry>, Option<u32>),
+    Absent,
+}
+
+#[derive(Clone)]
+struct Materialized {
+    anchor: Anchor,
+    ledger_info: LedgerInfo,
+    coverage: BTreeMap<KeyId, LookupState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Anchor {
+    sequence: u32,
+    hash: String,
+    protocol_version: u32,
+    timestamp: u64,
+    base_reserve: u32,
+}
+
+#[derive(Clone)]
+struct Network {
+    passphrase: String,
+    protocol_version: u32,
+}
+
+#[derive(Clone)]
+struct FetchedEntry {
+    entry: Rc<LedgerEntry>,
+    live_until: Option<u32>,
+}
+
+struct EntryBatch {
+    latest_ledger: u32,
+    entries: Vec<FetchedEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransportFailure {
+    operation: &'static str,
+    kind: TransportFailureKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransportFailureKind {
+    /// The request failed, or the RPC answer was not valid data.
+    Rpc,
+    /// The RPC answered, but ledger XDR in the answer does not decode with
+    /// this release's XDR definitions. A newer protocol can change that XDR.
+    /// Carries the ledger protocol reported in the same answer, if any.
+    UndecodableXdr { reported_protocol: Option<u32> },
+}
+
+impl TransportFailure {
+    const fn rpc(operation: &'static str) -> Self {
+        Self {
+            operation,
+            kind: TransportFailureKind::Rpc,
+        }
+    }
+
+    const fn undecodable_xdr(operation: &'static str, reported_protocol: Option<u32>) -> Self {
+        Self {
+            operation,
+            kind: TransportFailureKind::UndecodableXdr { reported_protocol },
+        }
+    }
+}
+
+trait Transport {
+    fn network(&self) -> Result<Network, TransportFailure>;
+    fn latest_ledger(&self) -> Result<Anchor, TransportFailure>;
+    fn ledger_entries(&self, keys: &[LedgerKey]) -> Result<EntryBatch, TransportFailure>;
+}
+
+pub(crate) struct TrackingSource {
+    cache: RefCell<BTreeMap<KeyId, LookupState>>,
+    requested: RefCell<BTreeMap<KeyId, LedgerKey>>,
+    unknown: RefCell<BTreeSet<KeyId>>,
+    transport: Option<Rc<dyn Transport>>,
+    local: Rc<LocalLedger>,
+    network_protocol_version: u32,
+    rpc_reads: Cell<u64>,
+    failure: Cell<Option<TransportFailure>>,
+}
+
+impl TrackingSource {
+    fn rpc_with_local(
+        cache: BTreeMap<KeyId, LookupState>,
+        transport: Rc<dyn Transport>,
+        local: Rc<LocalLedger>,
+        network_protocol_version: u32,
+    ) -> Self {
+        Self::new(cache, Some(transport), local, network_protocol_version)
+    }
+
+    fn strict_with_local(
+        cache: BTreeMap<KeyId, LookupState>,
+        local: Rc<LocalLedger>,
+        network_protocol_version: u32,
+    ) -> Self {
+        Self::new(cache, None, local, network_protocol_version)
+    }
+
+    fn new(
+        cache: BTreeMap<KeyId, LookupState>,
+        transport: Option<Rc<dyn Transport>>,
+        local: Rc<LocalLedger>,
+        network_protocol_version: u32,
+    ) -> Self {
+        Self {
+            cache: RefCell::new(cache),
+            requested: RefCell::new(BTreeMap::new()),
+            unknown: RefCell::new(BTreeSet::new()),
+            transport,
+            local,
+            network_protocol_version,
+            rpc_reads: Cell::new(0),
+            failure: Cell::new(None),
+        }
+    }
+
+    /// Ledger protocol of the network state this source serves.
+    pub(crate) const fn network_protocol_version(&self) -> u32 {
+        self.network_protocol_version
+    }
+
+    fn requested_keys(&self) -> BTreeMap<KeyId, LedgerKey> {
+        self.requested.borrow().clone()
+    }
+
+    pub(crate) fn unknown_keys(&self) -> BTreeSet<KeyId> {
+        self.unknown.borrow().clone()
+    }
+
+    pub(crate) fn rpc_reads(&self) -> u64 {
+        self.rpc_reads.get()
+    }
+
+    pub(crate) fn observe(&self, key: &Rc<LedgerKey>) -> Result<(), HostError> {
+        self.get(key).map(|_| ())
+    }
+
+    fn take_failure(&self) -> Option<TransportFailure> {
+        self.failure.take()
+    }
+
+    fn host_error() -> HostError {
+        HostError::from((ScErrorType::Storage, ScErrorCode::InternalError))
+    }
+}
+
+impl SnapshotSource for TrackingSource {
+    fn get(&self, key: &Rc<LedgerKey>) -> Result<Option<PresentEntry>, HostError> {
+        if self.failure.get().is_some() {
+            return Err(Self::host_error());
+        }
+        let Ok(id) = key_id(key) else {
+            self.failure
+                .set(Some(TransportFailure::rpc("ledger-key-encode")));
+            return Err(Self::host_error());
+        };
+        if self.local.owns(key) {
+            return Ok(None);
+        }
+        self.requested
+            .borrow_mut()
+            .insert(id.clone(), (**key).clone());
+        if let Some(state) = self.cache.borrow().get(&id).cloned() {
+            return Ok(match state {
+                LookupState::Present(entry, live_until) => Some((entry, live_until)),
+                LookupState::Absent => None,
+            });
+        }
+
+        let Some(transport) = &self.transport else {
+            self.unknown.borrow_mut().insert(id);
+            return Err(Self::host_error());
+        };
+        self.rpc_reads.set(self.rpc_reads.get() + 1);
+        let batch = match transport.ledger_entries(&[(**key).clone()]) {
+            Ok(batch) => batch,
+            Err(failure) => {
+                self.failure.set(Some(failure));
+                return Err(Self::host_error());
+            }
+        };
+        let Ok(returned) = validate_batch(&[(**key).clone()], batch.entries) else {
+            self.failure
+                .set(Some(TransportFailure::rpc("getLedgerEntries")));
+            return Err(Self::host_error());
+        };
+        let state = returned
+            .get(&id)
+            .cloned()
+            .map_or(LookupState::Absent, |entry| {
+                LookupState::Present(entry.entry, entry.live_until)
+            });
+        self.cache.borrow_mut().insert(id, state.clone());
+        Ok(match state {
+            LookupState::Present(entry, live_until) => Some((entry, live_until)),
+            LookupState::Absent => None,
+        })
+    }
+}
+
+struct RequestRateLimiter {
+    min_interval: Cell<Duration>,
+    next_request: Cell<Option<Instant>>,
+}
+
+impl RequestRateLimiter {
+    fn new(max_requests_per_second: u32) -> Self {
+        Self {
+            min_interval: Cell::new(request_interval(max_requests_per_second)),
+            next_request: Cell::new(None),
+        }
+    }
+
+    fn set_requests_per_second(&self, max_requests_per_second: u32) {
+        self.min_interval
+            .set(request_interval(max_requests_per_second));
+        self.next_request.set(None);
+    }
+
+    fn reserve_delay(&self, now: Instant) -> Duration {
+        let interval = self.min_interval.get();
+        if interval.is_zero() {
+            self.next_request.set(None);
+            return Duration::ZERO;
+        }
+        let Some(next_request) = self.next_request.get() else {
+            self.next_request.set(Some(now + interval));
+            return Duration::ZERO;
+        };
+        if next_request <= now {
+            self.next_request.set(Some(now + interval));
+            return Duration::ZERO;
+        }
+        self.next_request.set(Some(next_request + interval));
+        next_request.duration_since(now)
+    }
+
+    fn wait(&self) {
+        let delay = self.reserve_delay(Instant::now());
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+    }
+}
+
+fn request_interval(max_requests_per_second: u32) -> Duration {
+    if max_requests_per_second == 0 {
+        return Duration::ZERO;
+    }
+    let nanos = 1_000_000_000_u64.div_ceil(u64::from(max_requests_per_second));
+    Duration::from_nanos(nanos)
+}
+
+struct HttpTransport {
+    rpc_url: String,
+    agent: ureq::Agent,
+    rate_limiter: Rc<RequestRateLimiter>,
+}
+
+impl HttpTransport {
+    fn new(rpc_url: String, rate_limiter: Rc<RequestRateLimiter>) -> Self {
+        Self {
+            rpc_url,
+            agent: ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(30))
+                .build(),
+            rate_limiter,
+        }
+    }
+
+    fn rpc<T: DeserializeOwned>(
+        &self,
+        operation: &'static str,
+        params: &serde_json::Value,
+    ) -> Result<T, TransportFailure> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": operation,
+            "params": params,
+        });
+        let response = send_read_rpc_with_retry(
+            || {
+                self.rate_limiter.wait();
+                self.agent.post(&self.rpc_url).send_json(request.clone())
+            },
+            thread::sleep,
+        )
+        .map_err(|_| TransportFailure::rpc(operation))?;
+        let body: RpcResponse<T> = response
+            .into_json()
+            .map_err(|_| TransportFailure::rpc(operation))?;
+        if body.error.is_some() {
+            return Err(TransportFailure::rpc(operation));
+        }
+        body.result.ok_or(TransportFailure::rpc(operation))
+    }
+}
+
+// All RPC methods routed through this helper are read-only. Keep transaction
+// submission out of this retry path.
+fn send_read_rpc_with_retry(
+    mut send: impl FnMut() -> Result<ureq::Response, ureq::Error>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<ureq::Response, Box<ureq::Error>> {
+    let mut retry = 0_usize;
+    loop {
+        match send() {
+            Err(ureq::Error::Status(status, response))
+                if is_retryable_http_status(status) && retry < RPC_RETRY_BACKOFF.len() =>
+            {
+                let Some(delay) =
+                    retry_delay(RPC_RETRY_BACKOFF[retry], response.header("Retry-After"))
+                else {
+                    return Err(Box::new(ureq::Error::Status(status, response)));
+                };
+                retry += 1;
+                sleep(delay);
+            }
+            result => return result.map_err(Box::new),
+        }
+    }
+}
+
+const fn is_retryable_http_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+fn retry_delay(backoff: Duration, retry_after: Option<&str>) -> Option<Duration> {
+    let Some(retry_after) = retry_after else {
+        return Some(backoff);
+    };
+    let Ok(seconds) = retry_after.trim().parse::<u64>() else {
+        return Some(backoff);
+    };
+    let retry_after = Duration::from_secs(seconds);
+    // Do not violate a long server-requested pause by retrying early.
+    if retry_after > RPC_MAX_RETRY_AFTER {
+        return None;
+    }
+    Some(backoff.max(retry_after))
+}
+
+impl Transport for HttpTransport {
+    fn network(&self) -> Result<Network, TransportFailure> {
+        let wire: NetworkWire = self.rpc("getNetwork", &serde_json::json!({}))?;
+        Ok(Network {
+            passphrase: wire.passphrase,
+            protocol_version: wire.protocol_version,
+        })
+    }
+
+    fn latest_ledger(&self) -> Result<Anchor, TransportFailure> {
+        let wire: LatestWire = self.rpc(LATEST_LEDGER_OPERATION, &serde_json::json!({}))?;
+        decode_latest_ledger(wire)
+    }
+
+    fn ledger_entries(&self, keys: &[LedgerKey]) -> Result<EntryBatch, TransportFailure> {
+        let operation = "getLedgerEntries";
+        let encoded: Result<Vec<String>, _> = keys
+            .iter()
+            .map(|key| key.to_xdr(Limits::none()).map(|xdr| BASE64.encode(xdr)))
+            .collect();
+        let encoded = encoded.map_err(|_| TransportFailure::rpc(operation))?;
+        let wire: EntriesWire = self.rpc(operation, &serde_json::json!({ "keys": encoded }))?;
+        let entries = wire
+            .entries
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| decode_wire_entry(entry, operation))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(EntryBatch {
+            latest_ledger: wire.latest_ledger,
+            entries,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkWire {
+    passphrase: String,
+    protocol_version: u32,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LatestWire {
+    id: String,
+    protocol_version: u32,
+    sequence: u32,
+    close_time: String,
+    header_xdr: String,
+}
+
+const LATEST_LEDGER_OPERATION: &str = "getLatestLedger";
+
+/// Decodes and cross-checks a `getLatestLedger` answer.
+///
+/// A header that does not decode carries the answer's `protocolVersion`, so
+/// [`transport_error`] can report a protocol whose header format this release
+/// does not know as unsupported instead of as a transport failure.
+fn decode_latest_ledger(wire: LatestWire) -> Result<Anchor, TransportFailure> {
+    let operation = LATEST_LEDGER_OPERATION;
+    let bytes = BASE64
+        .decode(&wire.header_xdr)
+        .map_err(|_| TransportFailure::rpc(operation))?;
+    let header = LedgerHeader::from_xdr(bytes.clone(), Limits::none())
+        .map_err(|_| TransportFailure::undecodable_xdr(operation, Some(wire.protocol_version)))?;
+    let timestamp = wire
+        .close_time
+        .parse::<u64>()
+        .map_err(|_| TransportFailure::rpc(operation))?;
+    if header.ledger_seq != wire.sequence
+        || header.scp_value.close_time.0 != timestamp
+        || hex(Sha256::digest(bytes)) != wire.id
+    {
+        return Err(TransportFailure::rpc(operation));
+    }
+    Ok(Anchor {
+        sequence: wire.sequence,
+        hash: wire.id,
+        protocol_version: wire.protocol_version,
+        timestamp,
+        base_reserve: header.base_reserve,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EntriesWire {
+    entries: Option<Vec<EntryWire>>,
+    latest_ledger: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EntryWire {
+    key: String,
+    xdr: String,
+    last_modified_ledger_seq: u32,
+    live_until_ledger_seq: Option<u32>,
+    ext_xdr: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RpcResponse<T> {
+    result: Option<T>,
+    error: Option<serde_json::Value>,
+}
+
+/// Decodes one `getLedgerEntries` entry.
+///
+/// The answer reports no ledger protocol, so XDR that does not decode is
+/// marked without one; the caller supplies the protocol of the ledger read.
+fn decode_wire_entry(
+    wire: EntryWire,
+    operation: &'static str,
+) -> Result<FetchedEntry, TransportFailure> {
+    let undecodable = |_| TransportFailure::undecodable_xdr(operation, None);
+    let key_bytes = BASE64
+        .decode(wire.key)
+        .map_err(|_| TransportFailure::rpc(operation))?;
+    let key = LedgerKey::from_xdr(key_bytes, Limits::none()).map_err(undecodable)?;
+    let entry_bytes = BASE64
+        .decode(wire.xdr)
+        .map_err(|_| TransportFailure::rpc(operation))?;
+    let data = LedgerEntryData::from_xdr(entry_bytes, Limits::none()).map_err(undecodable)?;
+    let ext = wire
+        .ext_xdr
+        .ok_or(TransportFailure::rpc(operation))
+        .and_then(|encoded| {
+            BASE64
+                .decode(encoded)
+                .map_err(|_| TransportFailure::rpc(operation))
+        })
+        .and_then(|bytes| LedgerEntryExt::from_xdr(bytes, Limits::none()).map_err(undecodable))?;
+    let entry = LedgerEntry {
+        last_modified_ledger_seq: wire.last_modified_ledger_seq,
+        data,
+        ext,
+    };
+    if entry.to_key() != key {
+        return Err(TransportFailure::rpc(operation));
+    }
+    Ok(FetchedEntry {
+        entry: Rc::new(entry),
+        live_until: wire.live_until_ledger_seq,
+    })
+}
+
+fn validate_batch(
+    requested: &[LedgerKey],
+    entries: Vec<FetchedEntry>,
+) -> Result<BTreeMap<KeyId, FetchedEntry>, CaptureError> {
+    let requested: BTreeSet<KeyId> = requested.iter().map(key_id).collect::<Result<_, _>>()?;
+    let mut returned = BTreeMap::new();
+    for fetched in entries {
+        let derived = fetched.entry.to_key();
+        let id = key_id(&derived)?;
+        if !requested.contains(&id) || returned.insert(id, fetched).is_some() {
+            return Err(CaptureError::MalformedRpc {
+                operation: "getLedgerEntries",
+            });
+        }
+    }
+    Ok(returned)
+}
+
+fn extract_archival(entry: Option<&FetchedEntry>) -> Result<StateArchivalSettings, CaptureError> {
+    let Some(entry) = entry else {
+        return Err(CaptureError::MissingStateArchival);
+    };
+    match &entry.entry.data {
+        LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => {
+            Ok(settings.clone())
+        }
+        _ => Err(CaptureError::MalformedRpc {
+            operation: "getLedgerEntries",
+        }),
+    }
+}
+
+fn validate_coverage(
+    coverage: &BTreeMap<KeyId, LookupState>,
+    ledger_sequence: u32,
+    max_entry_ttl: u32,
+) -> Result<(), CaptureError> {
+    for (id, state) in coverage {
+        let LookupState::Present(entry, live_until) = state else {
+            continue;
+        };
+        if id != &key_id(&entry.to_key())? {
+            return Err(CaptureError::MalformedRpc {
+                operation: "getLedgerEntries",
+            });
+        }
+        if let LedgerEntryData::ContractCode(code) = &entry.data {
+            let digest: [u8; 32] = Sha256::digest(code.code.as_slice()).into();
+            if code.hash != Hash(digest) {
+                return Err(CaptureError::MalformedRpc {
+                    operation: "getLedgerEntries",
+                });
+            }
+        }
+        if !validate_entry_metadata(entry, *live_until, ledger_sequence, max_entry_ttl) {
+            return Err(CaptureError::MalformedRpc {
+                operation: "getLedgerEntries",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_entry_metadata(
+    entry: &LedgerEntry,
+    live_until: Option<u32>,
+    ledger_sequence: u32,
+    max_entry_ttl: u32,
+) -> bool {
+    if entry.last_modified_ledger_seq > ledger_sequence || max_entry_ttl == 0 {
+        return false;
+    }
+    let Some(max_live_until) = ledger_sequence.checked_add(max_entry_ttl.saturating_sub(1)) else {
+        return false;
+    };
+    let live_contract_ttl = |ttl: u32| ledger_sequence <= ttl && ttl <= max_live_until;
+
+    match &entry.data {
+        LedgerEntryData::ContractCode(_) => {
+            live_until.is_some_and(|ttl| ttl == 0 || live_contract_ttl(ttl))
+        }
+        LedgerEntryData::ContractData(data) => match data.durability {
+            ContractDataDurability::Persistent => {
+                live_until.is_some_and(|ttl| ttl == 0 || live_contract_ttl(ttl))
+            }
+            ContractDataDurability::Temporary => live_until.is_some_and(live_contract_ttl),
+        },
+        LedgerEntryData::Account(_) | LedgerEntryData::Trustline(_) => live_until.is_none(),
+        _ => false,
+    }
+}
+
+fn ensure_legacy_root_present(
+    root: &ScAddress,
+    coverage: &BTreeMap<KeyId, LookupState>,
+) -> Result<(), CaptureError> {
+    let id = key_id(&contract_instance_key(root.clone()))?;
+    match coverage.get(&id) {
+        Some(LookupState::Present(entry, _)) => match &entry.data {
+            LedgerEntryData::ContractData(data)
+                if matches!(data.val, ScVal::ContractInstance(_)) =>
+            {
+                Ok(())
+            }
+            _ => Err(CaptureError::CaptureBundleIntegrity),
+        },
+        _ => Err(CaptureError::CaptureBundleIntegrity),
+    }
+}
+
+fn ensure_executable_closure_present(
+    coverage: &BTreeMap<KeyId, LookupState>,
+) -> Result<(), CaptureError> {
+    for state in coverage.values() {
+        let LookupState::Present(entry, _) = state else {
+            continue;
+        };
+        let LedgerEntryData::ContractData(data) = &entry.data else {
+            continue;
+        };
+        let ScVal::ContractInstance(instance) = &data.val else {
+            continue;
+        };
+        match &instance.executable {
+            ContractExecutable::Wasm(hash) => ensure_code_present(coverage, hash)?,
+            ContractExecutable::ExternalRef(external_ref) => {
+                let Some(code_key) = external_ref_code_key(coverage, external_ref)? else {
+                    return Err(CaptureError::MissingExecutableReference);
+                };
+                let LedgerKey::ContractCode(code) = code_key else {
+                    return Err(CaptureError::InternalInvariant);
+                };
+                ensure_code_present(coverage, &code.hash)?;
+            }
+            ContractExecutable::StellarAsset => {}
+        }
+    }
+    Ok(())
+}
+
+fn executable_ref_key(external_ref: &ContractExecutableExternalRef) -> LedgerKey {
+    LedgerKey::ContractData(LedgerKeyContractData {
+        contract: external_ref.executable_owner.clone(),
+        key: ScVal::ExecutableTag(external_ref.tag.clone()),
+        durability: ContractDataDurability::Persistent,
+    })
+}
+
+fn external_ref_code_key(
+    coverage: &BTreeMap<KeyId, LookupState>,
+    external_ref: &ContractExecutableExternalRef,
+) -> Result<Option<LedgerKey>, CaptureError> {
+    let reference_key = executable_ref_key(external_ref);
+    let reference_id = key_id(&reference_key)?;
+    let Some(state) = coverage.get(&reference_id) else {
+        return Ok(None);
+    };
+    let LookupState::Present(entry, _) = state else {
+        return Err(CaptureError::MissingExecutableReference);
+    };
+    let LedgerEntryData::ContractData(data) = &entry.data else {
+        return Err(CaptureError::MalformedExecutableReference);
+    };
+    let ScVal::Bytes(bytes) = &data.val else {
+        return Err(CaptureError::MalformedExecutableReference);
+    };
+    let bytes: &[u8] = bytes.as_ref();
+    let hash = Hash(
+        bytes
+            .try_into()
+            .map_err(|_| CaptureError::MalformedExecutableReference)?,
+    );
+    Ok(Some(LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash,
+    })))
+}
+
+fn ensure_code_present(
+    coverage: &BTreeMap<KeyId, LookupState>,
+    hash: &Hash,
+) -> Result<(), CaptureError> {
+    let id = key_id(&LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: hash.clone(),
+    }))?;
+    if matches!(coverage.get(&id), Some(LookupState::Present(_, _))) {
+        Ok(())
+    } else {
+        Err(CaptureError::MissingReferencedCode)
+    }
+}
+
+fn snapshot_from_materialized(materialized: &Materialized) -> Result<LedgerSnapshot, CaptureError> {
+    let mut entries = Vec::new();
+    for (id, state) in &materialized.coverage {
+        let LookupState::Present(entry, live_until) = state else {
+            continue;
+        };
+        let key = entry.to_key();
+        if is_state_archival_key(&key) || id != &key_id(&key)? {
+            return Err(CaptureError::InternalInvariant);
+        }
+        entries.push((Box::new(key), (Box::new((**entry).clone()), *live_until)));
+    }
+    Ok(LedgerSnapshot {
+        protocol_version: materialized.ledger_info.protocol_version,
+        sequence_number: materialized.ledger_info.sequence_number,
+        timestamp: materialized.ledger_info.timestamp,
+        network_id: materialized.ledger_info.network_id,
+        base_reserve: materialized.ledger_info.base_reserve,
+        min_persistent_entry_ttl: materialized.ledger_info.min_persistent_entry_ttl,
+        min_temp_entry_ttl: materialized.ledger_info.min_temp_entry_ttl,
+        max_entry_ttl: materialized.ledger_info.max_entry_ttl,
+        ledger_entries: entries,
+    })
+}
+
+fn env_from_materialized(materialized: &Materialized, source: Rc<TrackingSource>) -> Env {
+    let snapshot = snapshot_from_materialized(materialized).expect("validated materialization");
+    fork_env(ForkEnvSeed::Ledger(SnapshotSourceInput {
+        source,
+        ledger_info: Some(materialized.ledger_info.clone()),
+        snapshot: Some(Rc::new(snapshot)),
+    }))
+}
+
+fn inventory_digest(coverage: &BTreeMap<KeyId, LookupState>) -> Result<[u8; 32], CaptureError> {
+    let mut digest = Sha256::new();
+    digest.update(INVENTORY_DIGEST_DOMAIN_V1);
+    digest.update((coverage.len() as u64).to_be_bytes());
+    for (key, state) in coverage {
+        digest.update((key.len() as u64).to_be_bytes());
+        digest.update(key);
+        match state {
+            LookupState::Present(entry, live_until) => {
+                digest.update([1]);
+                let xdr = entry
+                    .to_xdr(Limits::none())
+                    .map_err(|_| CaptureError::Xdr)?;
+                digest.update((xdr.len() as u64).to_be_bytes());
+                digest.update(xdr);
+                if let Some(live_until) = live_until {
+                    digest.update([1]);
+                    digest.update(live_until.to_be_bytes());
+                } else {
+                    digest.update([0]);
+                }
+            }
+            LookupState::Absent => digest.update([0]),
+        }
+    }
+    Ok(digest.finalize().into())
+}
+
+fn canonical_bundle_digest(
+    known_absent: &[String],
+    report: &BundleReport,
+    provenance: &BundleProvenance,
+    ledger_digest: &[u8; 32],
+    inventory_digest: &[u8; 32],
+) -> Result<[u8; 32], CaptureError> {
+    let mut digest = Sha256::new();
+    digest.update(BUNDLE_DIGEST_DOMAIN_V2);
+    digest.update(CAPTURE_BUNDLE_SCHEMA_VERSION.to_be_bytes());
+    update_bundle_digest(
+        &mut digest,
+        known_absent,
+        report,
+        provenance,
+        ledger_digest,
+        inventory_digest,
+    )?;
+    Ok(digest.finalize().into())
+}
+
+fn legacy_canonical_bundle_digest(
+    root_contract: &str,
+    known_absent: &[String],
+    report: &BundleReport,
+    provenance: &BundleProvenance,
+    ledger_digest: &[u8; 32],
+    inventory_digest: &[u8; 32],
+) -> Result<[u8; 32], CaptureError> {
+    let mut digest = Sha256::new();
+    digest.update(LEGACY_BUNDLE_DIGEST_DOMAIN_V1);
+    digest.update(1_u32.to_be_bytes());
+    digest_field(&mut digest, root_contract.as_bytes());
+    update_bundle_digest(
+        &mut digest,
+        known_absent,
+        report,
+        provenance,
+        ledger_digest,
+        inventory_digest,
+    )?;
+    Ok(digest.finalize().into())
+}
+
+fn update_bundle_digest(
+    digest: &mut Sha256,
+    known_absent: &[String],
+    report: &BundleReport,
+    provenance: &BundleProvenance,
+    ledger_digest: &[u8; 32],
+    inventory_digest: &[u8; 32],
+) -> Result<(), CaptureError> {
+    digest.update((known_absent.len() as u64).to_be_bytes());
+    for encoded in known_absent {
+        let key = BASE64
+            .decode(encoded)
+            .map_err(|_| CaptureError::MalformedCaptureBundle)?;
+        digest_field(digest, &key);
+    }
+    digest.update(report.discovery_rounds.to_be_bytes());
+    digest.update(report.present_entries.to_be_bytes());
+    digest.update(report.absent_entries.to_be_bytes());
+    digest.update(report.final_replay_rpc_reads.to_be_bytes());
+    digest_field(digest, provenance.rpc_origin.as_bytes());
+    digest_field(digest, provenance.network_passphrase.as_bytes());
+    digest.update(provenance.ledger_sequence.to_be_bytes());
+    digest_field(digest, provenance.ledger_hash.as_bytes());
+    digest.update(provenance.protocol_version.to_be_bytes());
+    digest.update(ledger_digest);
+    digest.update(inventory_digest);
+    Ok(())
+}
+
+fn digest_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn decode_hex_digest(value: &str) -> Result<[u8; 32], CaptureError> {
+    if value.len() != 64 || !value.is_ascii() {
+        return Err(CaptureError::MalformedCaptureBundle);
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = decode_hex_nibble(pair[0])?;
+        let low = decode_hex_nibble(pair[1])?;
+        decoded[index] = (high << 4) | low;
+    }
+    if hex(decoded) != value {
+        return Err(CaptureError::MalformedCaptureBundle);
+    }
+    Ok(decoded)
+}
+
+fn decode_hex_nibble(value: u8) -> Result<u8, CaptureError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(CaptureError::MalformedCaptureBundle),
+    }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CaptureError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or(CaptureError::MalformedCaptureBundle)?;
+    let (mut file, temporary_path) = create_temporary_file(parent, file_name)?;
+
+    if let Err(source) = file.write_all(bytes) {
+        drop(file);
+        cleanup_temporary_file(&temporary_path);
+        return Err(CaptureError::CaptureBundleIo {
+            operation: "write",
+            source,
+        });
+    }
+    if let Err(source) = file.sync_all() {
+        drop(file);
+        cleanup_temporary_file(&temporary_path);
+        return Err(CaptureError::CaptureBundleIo {
+            operation: "sync temporary file",
+            source,
+        });
+    }
+    drop(file);
+    if let Err(source) = fs::rename(&temporary_path, path) {
+        cleanup_temporary_file(&temporary_path);
+        return Err(CaptureError::CaptureBundleIo {
+            operation: "rename",
+            source,
+        });
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| CaptureError::CaptureBundleIo {
+            operation: "sync destination directory",
+            source,
+        })
+}
+
+fn create_temporary_file(
+    parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> Result<(File, PathBuf), CaptureError> {
+    for _ in 0..32 {
+        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = file_name.to_os_string();
+        temporary_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+        let temporary_path = parent.join(temporary_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => return Ok((file, temporary_path)),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(CaptureError::CaptureBundleIo {
+                    operation: "create temporary file",
+                    source,
+                });
+            }
+        }
+    }
+    Err(CaptureError::CaptureBundleIo {
+        operation: "create temporary file",
+        source: io::Error::new(io::ErrorKind::AlreadyExists, "temporary name exhaustion"),
+    })
+}
+
+fn cleanup_temporary_file(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+fn parse_legacy_contract_address(value: &str) -> Result<ScAddress, CaptureError> {
+    let mut env = Env::default();
+    configure_fork_env(&mut env);
+    let address = catch_unwind(AssertUnwindSafe(|| Address::from_str(&env, value)))
+        .map_err(|_| CaptureError::MalformedCaptureBundle)?;
+    let address: ScAddress = (&address).into();
+    if matches!(address, ScAddress::Contract(_)) {
+        Ok(address)
+    } else {
+        Err(CaptureError::MalformedCaptureBundle)
+    }
+}
+
+fn key_id(key: &LedgerKey) -> Result<KeyId, CaptureError> {
+    key.to_xdr(Limits::none()).map_err(|_| CaptureError::Xdr)
+}
+
+pub(crate) fn contract_instance_key(contract: ScAddress) -> LedgerKey {
+    LedgerKey::ContractData(LedgerKeyContractData {
+        contract,
+        key: ScVal::LedgerKeyContractInstance,
+        durability: ContractDataDurability::Persistent,
+    })
+}
+
+fn state_archival_key() -> LedgerKey {
+    LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::StateArchival,
+    })
+}
+
+fn is_state_archival_key(key: &LedgerKey) -> bool {
+    matches!(
+        key,
+        LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::StateArchival
+        })
+    )
+}
+
+/// Converts a transport failure into the public capture error.
+///
+/// Ledger XDR that does not decode, read from a ledger whose protocol is not
+/// [`SUPPORTED_PROTOCOL_VERSION`], is reported as that protocol being
+/// unsupported: a newer protocol can change the ledger XDR, and the remedy is
+/// the Kanatoko release line for that protocol, not a retry. The same failure
+/// at the supported protocol stays an RPC failure. `network_protocol_version`
+/// is the protocol of the ledger being read when the caller knows it; a
+/// protocol reported in the failed answer itself takes precedence.
+fn transport_error(
+    failure: TransportFailure,
+    network_protocol_version: Option<u32>,
+) -> CaptureError {
+    let undecodable_at = match failure.kind {
+        TransportFailureKind::UndecodableXdr { reported_protocol } => {
+            reported_protocol.or(network_protocol_version)
+        }
+        TransportFailureKind::Rpc => None,
+    };
+    match undecodable_at {
+        Some(found) if found != SUPPORTED_PROTOCOL_VERSION => CaptureError::UnsupportedProtocol {
+            found,
+            supported: SUPPORTED_PROTOCOL_VERSION,
+        },
+        _ => CaptureError::Transport {
+            operation: failure.operation,
+        },
+    }
+}
+
+fn redact_rpc_origin(raw: &str) -> Result<String, CaptureError> {
+    let (scheme, remainder) = raw.split_once("://").ok_or(CaptureError::InvalidRpcUrl)?;
+    if !matches!(scheme, "http" | "https") {
+        return Err(CaptureError::InvalidRpcUrl);
+    }
+    let authority = remainder
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|authority| !authority.is_empty())
+        .ok_or(CaptureError::InvalidRpcUrl)?;
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host.is_empty() {
+        return Err(CaptureError::InvalidRpcUrl);
+    }
+    Ok(format!("{scheme}://{host}"))
+}
+
+fn hex(bytes: impl AsRef<[u8]>) -> String {
+    let mut output = String::with_capacity(bytes.as_ref().len() * 2);
+    for byte in bytes.as_ref() {
+        use fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("String writes are infallible");
+    }
+    output
+}
+
+#[cfg(all(test, kanatoko_local_wasm_fixtures))]
+mod tests {
+    use std::{
+        cell::{Cell, RefCell},
+        collections::{BTreeMap, BTreeSet, VecDeque},
+        rc::Rc,
+    };
+
+    use soroban_env_host::xdr::{
+        ContractDataEntry, ContractExecutableExternalRef, ContractId, ExtensionPoint,
+        LedgerEntryData, LedgerEntryExt, LedgerEntryExtensionV1, LedgerEntryExtensionV1Ext,
+        LedgerKeyContractData, ScAddress, ScString, ScVal, SponsorshipDescriptor,
+        StateArchivalSettings, StellarValue, TimePoint,
+    };
+    use soroban_ledger_snapshot::LedgerSnapshot;
+    use soroban_sdk::{
+        testutils::{MockAuth, MockAuthInvoke},
+        token::StellarAssetClient,
+        Address, IntoVal, TryFromVal,
+    };
+
+    use super::*;
+    use crate::SUPPORTED_PROTOCOL_VERSION;
+
+    mod local_wrapper {
+        #![allow(clippy::too_many_arguments)]
+
+        soroban_sdk::contractimport!(
+            file = "fixtures/wasm/kanatoko_soroswap_wrapper.wasm",
+            sha256 = "1e7bca07c5aa5c2f31544857027799285dff97266ed7895cf21d0e6736dcb3a8",
+        );
+    }
+
+    mod local_stateful {
+        soroban_sdk::contractimport!(
+            file = "fixtures/wasm/kanatoko_stateful_fixture.wasm",
+            sha256 = "0156a9a840e4147732fcf0479846220840ae4b4281c58354aa31cf70daf6b2ea",
+        );
+    }
+
+    const PAIR_ID: &str = "CAM7DY53G63XA4AJRS24Z6VFYAFSSF76C3RZ45BE5YU3FQS5255OOABP";
+    const ROUTER_ID: &str = "CAG5LRYQ5JVEUI5TEID72EYOVX44TTUJT5BQR2J6J77FH65PCCFAJDDH";
+    const XLM_ID: &str = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA";
+    const USDC_ID: &str = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75";
+    const ONE_USDC: i128 = 10_000_000;
+    const DEADLINE: u64 = u64::MAX;
+    const CAPTURE_PATH: &str = "fixtures/mainnet/soroswap-xlm-usdc/capture.json";
+
+    #[test]
+    fn empty_scenario_does_not_seed_any_contract() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let captured = builder(&fake).capture(|_| {}).unwrap();
+
+        assert!(captured
+            .frozen_fixture()
+            .ledger_snapshot()
+            .ledger_entries
+            .is_empty());
+        assert_eq!(captured.report().present_entries(), 0);
+        assert_eq!(captured.report().absent_entries(), 0);
+        assert_eq!(captured.report().final_replay_rpc_reads(), 0);
+    }
+
+    #[test]
+    fn touched_contract_instance_and_matching_wasm_are_discovered() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let captured = builder(&fake)
+            .capture(|env| {
+                let pair_id = Address::from_str(env, PAIR_ID);
+                assert_eq!(
+                    local_wrapper::Client::new(env, &pair_id).token_1(),
+                    Address::from_str(env, USDC_ID)
+                );
+            })
+            .unwrap();
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let contract_id = key_id(&contract_instance_key(contract)).unwrap();
+
+        let contract_entry = captured
+            .frozen_fixture()
+            .ledger_snapshot()
+            .ledger_entries
+            .iter()
+            .find(|(key, _)| key_id(key).unwrap() == contract_id)
+            .unwrap();
+        let LedgerEntryData::ContractData(data) = &contract_entry.1 .0.data else {
+            panic!("contract instance must be contract data");
+        };
+        let ScVal::ContractInstance(instance) = &data.val else {
+            panic!("contract instance must contain a contract instance value");
+        };
+        let ContractExecutable::Wasm(hash) = &instance.executable else {
+            panic!("Soroswap pair must be WASM");
+        };
+        let code_id = key_id(&LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: hash.clone(),
+        }))
+        .unwrap();
+        assert!(captured
+            .frozen_fixture()
+            .ledger_snapshot()
+            .ledger_entries
+            .iter()
+            .any(|(key, _)| key_id(key).unwrap() == code_id));
+        assert_eq!(captured.report().final_replay_rpc_reads(), 0);
+    }
+
+    #[test]
+    fn external_ref_closure_materializes_reference_and_wasm_code() {
+        let (fake, instance_key, reference_key, code_key) = external_ref_transport();
+        let expanded = expand_from_instance(&fake, instance_key).unwrap();
+
+        for required in [reference_key, code_key] {
+            assert!(matches!(
+                expanded.coverage.get(&key_id(&required).unwrap()),
+                Some(LookupState::Present(_, _))
+            ));
+        }
+
+        let source = Rc::new(TrackingSource::strict_with_local(
+            expanded.coverage.clone(),
+            Rc::new(LocalLedger::default()),
+            expanded.ledger_info.protocol_version,
+        ));
+        let env = env_from_materialized(&expanded, source.clone());
+        let pair = Address::from_str(&env, PAIR_ID);
+        assert_eq!(
+            local_wrapper::Client::new(&env, &pair).token_1(),
+            Address::from_str(&env, USDC_ID)
+        );
+        assert_eq!(source.rpc_reads(), 0);
+        assert!(source.unknown_keys().is_empty());
+    }
+
+    #[test]
+    fn external_ref_closure_rejects_an_absent_reference() {
+        let (mut fake, instance_key, reference_key, _) = external_ref_transport();
+        Rc::get_mut(&mut fake)
+            .unwrap()
+            .entries
+            .remove(&key_id(&reference_key).unwrap());
+
+        assert!(matches!(
+            expand_from_instance(&fake, instance_key),
+            Err(CaptureError::MissingExecutableReference)
+        ));
+    }
+
+    #[test]
+    fn external_ref_closure_rejects_a_malformed_reference() {
+        let (mut fake, instance_key, reference_key, _) = external_ref_transport();
+        let fake_mut = Rc::get_mut(&mut fake).unwrap();
+        let reference_id = key_id(&reference_key).unwrap();
+        let fetched = fake_mut.entries.get(&reference_id).unwrap();
+        let mut entry = fetched.entry.as_ref().clone();
+        let LedgerEntryData::ContractData(data) = &mut entry.data else {
+            panic!("reference must be contract data");
+        };
+        data.val = ScVal::Bytes(vec![0_u8; 31].try_into().unwrap());
+        fake_mut.entries.insert(
+            reference_id,
+            FetchedEntry {
+                entry: Rc::new(entry),
+                live_until: fetched.live_until,
+            },
+        );
+
+        assert!(matches!(
+            expand_from_instance(&fake, instance_key),
+            Err(CaptureError::MalformedExecutableReference)
+        ));
+    }
+
+    #[test]
+    fn external_ref_closure_rejects_absent_wasm_code() {
+        let (mut fake, instance_key, _, code_key) = external_ref_transport();
+        Rc::get_mut(&mut fake)
+            .unwrap()
+            .entries
+            .remove(&key_id(&code_key).unwrap());
+
+        assert!(matches!(
+            expand_from_instance(&fake, instance_key),
+            Err(CaptureError::MissingReferencedCode)
+        ));
+    }
+
+    #[test]
+    fn external_ref_refresh_follows_a_changed_wasm_hash() {
+        let (mut fake, instance_key, reference_key, old_code_key) = external_ref_transport();
+        let mut keys = BTreeMap::new();
+        keys.insert(key_id(&instance_key).unwrap(), instance_key);
+        {
+            let builder = builder(&fake);
+            let materialized = builder.materialize(&keys).unwrap();
+            builder
+                .expand_code_closure(&mut keys, materialized)
+                .unwrap();
+        }
+        assert!(keys.contains_key(&key_id(&old_code_key).unwrap()));
+
+        let fake_mut = Rc::get_mut(&mut fake).unwrap();
+        let replacement_code_key = fake_mut
+            .entries
+            .values()
+            .find_map(|fetched| match &fetched.entry.data {
+                LedgerEntryData::ContractCode(code) if code.hash != code_hash(&old_code_key) => {
+                    Some(LedgerKey::ContractCode(LedgerKeyContractCode {
+                        hash: code.hash.clone(),
+                    }))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let LedgerKey::ContractCode(replacement_code) = &replacement_code_key else {
+            unreachable!();
+        };
+        let reference_id = key_id(&reference_key).unwrap();
+        let fetched = fake_mut.entries.get(&reference_id).unwrap();
+        let mut reference_entry = fetched.entry.as_ref().clone();
+        let LedgerEntryData::ContractData(reference_data) = &mut reference_entry.data else {
+            panic!("reference must be contract data");
+        };
+        reference_data.val = ScVal::Bytes(replacement_code.hash.0.to_vec().try_into().unwrap());
+        fake_mut.entries.insert(
+            reference_id,
+            FetchedEntry {
+                entry: Rc::new(reference_entry),
+                live_until: fetched.live_until,
+            },
+        );
+        fake_mut.anchor.sequence += 1;
+        fake_mut.anchor.hash = "external-ref-new-hash".to_string();
+
+        let builder = builder(&fake);
+        let materialized = builder.materialize(&keys).unwrap();
+        let refreshed = builder
+            .expand_code_closure(&mut keys, materialized)
+            .unwrap();
+
+        assert!(matches!(
+            refreshed
+                .coverage
+                .get(&key_id(&replacement_code_key).unwrap()),
+            Some(LookupState::Present(_, _))
+        ));
+    }
+
+    #[test]
+    fn external_ref_closure_is_bounded_when_reference_never_stabilizes() {
+        let (fake, instance_key, reference_key, _) = external_ref_transport();
+        let transport = Rc::new(ChangingExternalRefTransport {
+            inner: fake,
+            reference_id: key_id(&reference_key).unwrap(),
+            generation: Cell::new(0),
+        });
+        let mut keys = BTreeMap::new();
+        keys.insert(key_id(&instance_key).unwrap(), instance_key);
+        let builder = CaptureBuilder::with_transport(transport.clone(), MAINNET_PASSPHRASE);
+        let materialized = builder.materialize(&keys).unwrap();
+
+        assert!(matches!(
+            builder.expand_code_closure(&mut keys, materialized),
+            Err(CaptureError::ExecutableClosureLimit { rounds })
+                if rounds == MAX_EXECUTABLE_CLOSURE_ROUNDS
+        ));
+        assert_eq!(transport.generation.get(), MAX_EXECUTABLE_CLOSURE_ROUNDS);
+    }
+
+    #[test]
+    fn bundle_validation_rejects_an_incomplete_external_ref_closure() {
+        let (fake, instance_key, reference_key, _) = external_ref_transport();
+        let mut materialized = expand_from_instance(&fake, instance_key).unwrap();
+        materialized
+            .coverage
+            .remove(&key_id(&reference_key).unwrap());
+        let present_entries = materialized
+            .coverage
+            .values()
+            .filter(|state| matches!(state, LookupState::Present(_, _)))
+            .count();
+        let report = BundleReport {
+            discovery_rounds: 1,
+            present_entries: u64::try_from(present_entries).unwrap(),
+            absent_entries: u64::try_from(materialized.coverage.len() - present_entries).unwrap(),
+            final_replay_rpc_reads: 0,
+        };
+        let digest = inventory_digest(&materialized.coverage).unwrap();
+
+        assert!(matches!(
+            validate_bundle_coverage(
+                &materialized.coverage,
+                &report,
+                &digest,
+                materialized.ledger_info.sequence_number,
+                materialized.ledger_info.max_entry_ttl,
+            ),
+            Err(CaptureError::CaptureBundleIntegrity)
+        ));
+    }
+
+    #[test]
+    fn soroswap_snapshot_auto_discovers_quote_mint_swap_dependencies_and_replays_offline() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let captured = builder(&fake).capture(soroswap_scenario).unwrap();
+        assert!(captured.report().present_entries() >= 9);
+        assert!(captured.report().absent_entries() >= 1);
+        let reads_before = fake.ledger_entry_reads();
+        captured.replay(soroswap_scenario).unwrap();
+        assert_eq!(fake.ledger_entry_reads(), reads_before);
+    }
+
+    #[test]
+    fn auto_runner_mixes_imported_abi_and_dynamic_invocations_then_reuses_cache_offline() {
+        use crate::auto::{AutoRunner, CacheStatus};
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner");
+        let first = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(mixed_auto_scenario)
+            .unwrap();
+        assert_eq!(first.cache_status(), CacheStatus::Created);
+        assert_eq!(first.fixture().report().final_replay_rpc_reads(), 0);
+        let reads_after_capture = fake.ledger_entry_reads();
+
+        let second = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .offline()
+            .run(mixed_auto_scenario)
+            .unwrap();
+        assert_eq!(second.cache_status(), CacheStatus::Hit);
+        assert_eq!(fake.ledger_entry_reads(), reads_after_capture);
+        assert_eq!(second.fixture().report().final_replay_rpc_reads(), 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_runner_cache_hit_ignores_invalid_rpc_override() {
+        use crate::auto::{mainnet, AutoRunError, AutoRunner, CacheStatus};
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-invalid-rpc-cache-hit");
+        AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|_| {})
+            .unwrap();
+        let reads_after_capture = fake.ledger_entry_reads();
+
+        assert!(matches!(
+            mainnet()
+                .rpc_url("this-is-not-a-url")
+                .cache(&path)
+                .run(|_| {}),
+            Err(AutoRunError::Capture(CaptureError::InvalidRpcUrl))
+        ));
+        let replayed = mainnet()
+            .rpc_url("this-is-not-a-url")
+            .cache(&path)
+            .offline()
+            .run(|_| {})
+            .unwrap();
+
+        assert_eq!(replayed.cache_status(), CacheStatus::Hit);
+        assert_eq!(fake.ledger_entry_reads(), reads_after_capture);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_runner_deploys_local_wasm_that_calls_captured_contract_offline() {
+        use crate::auto::{AutoRunner, CacheStatus};
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-local-wasm");
+        let scenario = |fork: &crate::auto::ScenarioFork<'_>| {
+            let router = fork.contract(ROUTER_ID);
+            let pair = fork.contract(PAIR_ID);
+            let path = usdc_to_xlm_path(fork.env());
+            let candidate = fork.deploy(local_wrapper::WASM, (router.clone(), pair));
+            let direct = fork.invoke::<soroban_sdk::Vec<i128>>(
+                &router,
+                "router_get_amounts_out",
+                (ONE_USDC, path.clone()),
+            );
+            let through_candidate = local_wrapper::Client::new(fork.env(), &candidate)
+                .router_get_amounts_out(&ONE_USDC, &path);
+            assert_eq!(through_candidate, direct);
+        };
+
+        let first = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(scenario)
+            .unwrap();
+        assert_eq!(first.cache_status(), CacheStatus::Created);
+        let local_code_hash = Hash(Sha256::digest(local_wrapper::WASM).into());
+        assert!(first
+            .fixture()
+            .frozen_fixture()
+            .ledger_snapshot()
+            .ledger_entries
+            .iter()
+            .all(|(_, (entry, _))| !matches!(
+                &entry.data,
+                LedgerEntryData::ContractCode(code) if code.hash == local_code_hash
+            )));
+        let reads_after_capture = fake.ledger_entry_reads();
+
+        let second = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .offline()
+            .run(scenario)
+            .unwrap();
+        assert_eq!(second.cache_status(), CacheStatus::Hit);
+        assert_eq!(fake.ledger_entry_reads(), reads_after_capture);
+
+        let changed_candidate = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .offline()
+            .run(|fork| {
+                let candidate = fork.deploy(local_stateful::WASM, (41_i64,));
+                assert_eq!(
+                    local_stateful::Client::new(fork.env(), &candidate).get(),
+                    41
+                );
+            })
+            .unwrap();
+        assert_eq!(changed_candidate.cache_status(), CacheStatus::Hit);
+        assert_eq!(fake.ledger_entry_reads(), reads_after_capture);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_runner_replaces_captured_wasm_and_reuses_cache_offline() {
+        use crate::auto::{AutoRunner, CacheStatus};
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-replace-wasm");
+        let scenario = |fork: &crate::auto::ScenarioFork<'_>| {
+            let pool = fork.contract(PAIR_ID);
+            assert_eq!(
+                fork.replace_wasm(&pool, local_stateful::WASM),
+                <[u8; 32]>::from(Sha256::digest(local_stateful::WASM))
+            );
+            assert_eq!(local_stateful::Client::new(fork.env(), &pool).get(), 0);
+        };
+
+        let first = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(scenario)
+            .unwrap();
+        assert_eq!(first.cache_status(), CacheStatus::Created);
+        let local_code_hash = Hash(Sha256::digest(local_stateful::WASM).into());
+        assert!(first
+            .fixture()
+            .frozen_fixture()
+            .ledger_snapshot()
+            .ledger_entries
+            .iter()
+            .all(|(_, (entry, _))| !matches!(
+                &entry.data,
+                LedgerEntryData::ContractCode(code) if code.hash == local_code_hash
+            )));
+        let reads_after_capture = fake.ledger_entry_reads();
+
+        let second = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .offline()
+            .run(scenario)
+            .unwrap();
+        assert_eq!(second.cache_status(), CacheStatus::Hit);
+        assert_eq!(fake.ledger_entry_reads(), reads_after_capture);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn preview_only_dependencies_reach_fixed_point_and_replay_offline() {
+        use crate::{
+            auto::{AutoRunner, CacheStatus},
+            PreviewAuth,
+        };
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-preview-only");
+        let scenario = |fork: &crate::auto::ScenarioFork<'_>| {
+            let router = fork.contract(ROUTER_ID);
+            let pair = fork.contract(PAIR_ID);
+            let path = usdc_to_xlm_path(fork.env());
+            let candidate = fork.deploy(local_wrapper::WASM, (router, pair));
+            let report = fork
+                .preview(
+                    &candidate,
+                    "router_get_amounts_out",
+                    (ONE_USDC, path),
+                    PreviewAuth::Record,
+                )
+                .unwrap();
+            let amounts = report.result::<soroban_sdk::Vec<i128>>(fork.env()).unwrap();
+            assert!(amounts.get(1).unwrap() > 0);
+        };
+
+        let first = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(scenario)
+            .unwrap();
+        assert_eq!(first.cache_status(), CacheStatus::Created);
+        assert!(first.fixture().report().present_entries() > 0);
+        let reads_after_capture = fake.ledger_entry_reads();
+
+        let second = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .offline()
+            .run(scenario)
+            .unwrap();
+        assert_eq!(second.cache_status(), CacheStatus::Hit);
+        assert_eq!(fake.ledger_entry_reads(), reads_after_capture);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_runner_recaptures_unknown_scenario_keys_and_replaces_cache() {
+        use crate::auto::{AutoRunner, CacheStatus};
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-refresh");
+        AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|fork| mixed_auto_scenario_for_user(fork, "first-user"))
+            .unwrap();
+        let reads_before_refresh = fake.ledger_entry_reads();
+
+        let refreshed = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|fork| mixed_auto_scenario_for_user(fork, "second-user"))
+            .unwrap();
+        assert_eq!(refreshed.cache_status(), CacheStatus::Refreshed);
+        assert!(fake.ledger_entry_reads() > reads_before_refresh);
+
+        let reads_after_refresh = fake.ledger_entry_reads();
+        let replayed = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .offline()
+            .run(|fork| mixed_auto_scenario_for_user(fork, "second-user"))
+            .unwrap();
+        assert_eq!(replayed.cache_status(), CacheStatus::Hit);
+        assert_eq!(fake.ledger_entry_reads(), reads_after_refresh);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_runner_online_cache_hit_probes_anchor_without_entry_reads() {
+        use crate::auto::{AutoRunner, CacheStatus};
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-anchor-hit");
+        AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|_| {})
+            .unwrap();
+        let network_reads = fake.network_reads.get();
+        let latest_reads = fake.latest_reads.get();
+        let entry_reads = fake.ledger_entry_reads();
+
+        let hit = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|_| {})
+            .unwrap();
+
+        assert_eq!(hit.cache_status(), CacheStatus::Hit);
+        assert_eq!(fake.network_reads.get(), network_reads + 1);
+        assert_eq!(fake.latest_reads.get(), latest_reads + 1);
+        assert_eq!(fake.ledger_entry_reads(), entry_reads);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_runner_warm_refreshes_known_keys_at_a_newer_ledger() {
+        assert_warm_refreshes_known_key(false);
+    }
+
+    #[test]
+    fn auto_runner_warm_refreshes_known_keys_for_same_sequence_different_hash() {
+        assert_warm_refreshes_known_key(true);
+    }
+
+    #[test]
+    fn auto_runner_warm_refreshes_large_inventory_in_bounded_batches() {
+        use crate::auto::{AutoRunner, CacheStatus};
+
+        let mut fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-warm-refresh-large-inventory");
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let keys: Vec<LedgerKey> = (0..MAX_KEYS_PER_BATCH)
+            .map(|value| data_key(contract.clone(), u32::try_from(value).unwrap() + 1_000))
+            .collect();
+        let scenario = |fork: &crate::auto::ScenarioFork<'_>| {
+            for key in &keys {
+                assert!(fork
+                    .env()
+                    .host()
+                    .get_ledger_entry(&Rc::new(key.clone()))
+                    .unwrap()
+                    .is_none());
+            }
+        };
+        AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(scenario)
+            .unwrap();
+
+        {
+            let fake_mut = Rc::get_mut(&mut fake).unwrap();
+            fake_mut.anchor.sequence += 1;
+            fake_mut.anchor.hash = "large-inventory-new-ledger".to_string();
+        }
+        fake.batch_calls.borrow_mut().clear();
+
+        let refreshed = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(scenario)
+            .unwrap();
+        let batch_sizes: Vec<usize> = fake.batch_calls.borrow().iter().map(Vec::len).collect();
+
+        assert_eq!(refreshed.cache_status(), CacheStatus::Refreshed);
+        assert_eq!(batch_sizes, vec![MAX_KEYS_PER_BATCH, 1]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_runner_same_ledger_unknown_seeds_recapture_from_cached_inventory() {
+        use crate::auto::{AutoRunner, CacheStatus};
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-same-anchor-unknown");
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let first_key = data_key(contract.clone(), 880);
+        let second_key = data_key(contract, 881);
+        AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|fork| {
+                assert!(fork
+                    .env()
+                    .host()
+                    .get_ledger_entry(&Rc::new(first_key.clone()))
+                    .unwrap()
+                    .is_none());
+            })
+            .unwrap();
+        fake.batch_calls.borrow_mut().clear();
+
+        let refreshed = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|fork| {
+                assert!(fork
+                    .env()
+                    .host()
+                    .get_ledger_entry(&Rc::new(first_key.clone()))
+                    .unwrap()
+                    .is_none());
+                assert!(fork
+                    .env()
+                    .host()
+                    .get_ledger_entry(&Rc::new(second_key.clone()))
+                    .unwrap()
+                    .is_none());
+            })
+            .unwrap();
+
+        let first_id = key_id(&first_key).unwrap();
+        assert_eq!(refreshed.cache_status(), CacheStatus::Refreshed);
+        assert!(fake
+            .batch_calls
+            .borrow()
+            .iter()
+            .any(|batch| batch.len() > 1 && batch.contains(&first_id)));
+        assert!(!fake
+            .batch_calls
+            .borrow()
+            .iter()
+            .any(|batch| batch == std::slice::from_ref(&first_id)));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_runner_offline_replay_is_pinned_and_makes_no_transport_calls() {
+        use crate::auto::{AutoRunner, CacheStatus};
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-offline-pinned");
+        AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|_| {})
+            .unwrap();
+        let before = (
+            fake.network_reads.get(),
+            fake.latest_reads.get(),
+            fake.ledger_entry_reads(),
+        );
+
+        let hit = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .offline()
+            .run(|_| {})
+            .unwrap();
+
+        assert_eq!(hit.cache_status(), CacheStatus::Hit);
+        assert_eq!(
+            (
+                fake.network_reads.get(),
+                fake.latest_reads.get(),
+                fake.ledger_entry_reads()
+            ),
+            before
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_warm_refresh_preserves_previous_cache_file() {
+        use crate::auto::AutoRunner;
+
+        let mut fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-failed-warm-refresh");
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let known = data_key(contract, 882);
+        AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|fork| {
+                let _ = fork.env().host().get_ledger_entry(&Rc::new(known.clone()));
+            })
+            .unwrap();
+        let original = fs::read(&path).unwrap();
+        let known_id = key_id(&known).unwrap();
+        let fake_mut = Rc::get_mut(&mut fake).unwrap();
+        fake_mut.anchor.sequence += 1;
+        fake_mut.anchor.hash = "new-ledger-that-fails".to_string();
+        fake_mut.fail_keys.get_mut().insert(known_id);
+
+        let result = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|fork| {
+                let _ = fork.env().host().get_ledger_entry(&Rc::new(known.clone()));
+            });
+
+        assert!(matches!(
+            result,
+            Err(crate::auto::AutoRunError::Capture(
+                CaptureError::Transport {
+                    operation: "getLedgerEntries"
+                }
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_runner_offline_missing_cache_fails_without_rpc_reads() {
+        use crate::auto::{AutoRunError, AutoRunner};
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path("auto-runner-missing");
+        let result = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .offline()
+            .run(|_| {});
+
+        assert!(matches!(
+            result,
+            Err(AutoRunError::OfflineCacheMissing { path: missing }) if missing == path
+        ));
+        assert_eq!(fake.ledger_entry_reads(), 0);
+    }
+
+    #[test]
+    fn versioned_bundle_roundtrips_and_replays_strictly_offline() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let captured = builder(&fake).capture(soroswap_scenario).unwrap();
+        let path = test_bundle_path("roundtrip");
+        captured.write_file(&path).unwrap();
+
+        let loaded = CapturedFixture::from_file(&path, MAINNET_PASSPHRASE).unwrap();
+        assert_eq!(loaded.report(), captured.report());
+        assert_eq!(loaded.provenance(), captured.provenance());
+        assert_eq!(
+            loaded.frozen_fixture().ledger_digest(),
+            captured.frozen_fixture().ledger_digest()
+        );
+        let reads_before = fake.ledger_entry_reads();
+        loaded.replay(soroswap_scenario).unwrap();
+        assert_eq!(fake.ledger_entry_reads(), reads_before);
+        assert!(matches!(
+            CapturedFixture::from_file(&path, "not the captured network"),
+            Err(CaptureError::NetworkMismatch)
+        ));
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(document["schema_version"], 2);
+        assert!(document.get("root_contract").is_none());
+        document["root_contract"] = serde_json::Value::String(PAIR_ID.to_string());
+        fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        assert!(matches!(
+            CapturedFixture::from_file(&path, MAINNET_PASSPHRASE),
+            Err(CaptureError::MalformedCaptureBundle)
+        ));
+        document.as_object_mut().unwrap().remove("root_contract");
+        document["schema_version"] = serde_json::Value::from(3);
+        fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        assert!(matches!(
+            CapturedFixture::from_file(&path, MAINNET_PASSPHRASE),
+            Err(CaptureError::UnsupportedCaptureBundleSchema {
+                found: 3,
+                supported: 2
+            })
+        ));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn versioned_bundle_rejects_digest_tampering() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let captured = builder(&fake).capture(soroswap_scenario).unwrap();
+        let path = test_bundle_path("tamper");
+        captured.write_file(&path).unwrap();
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        document["ledger_digest"] = serde_json::Value::String("00".repeat(32));
+        fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        assert!(matches!(
+            CapturedFixture::from_file(&path, MAINNET_PASSPHRASE),
+            Err(CaptureError::CaptureBundleIntegrity)
+        ));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn capture_and_bundle_loading_reject_invalid_ledger_metadata() {
+        let mut fake = FakeTransport::from_soroswap_snapshot();
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let contract_id = key_id(&contract_instance_key(contract)).unwrap();
+        Rc::get_mut(&mut fake)
+            .unwrap()
+            .entries
+            .get_mut(&contract_id)
+            .unwrap()
+            .live_until = None;
+        assert!(matches!(
+            builder(&fake).capture(|env| {
+                let pair_id = Address::from_str(env, PAIR_ID);
+                let _ = local_wrapper::Client::new(env, &pair_id).token_0();
+            }),
+            Err(CaptureError::MalformedRpc { .. })
+        ));
+
+        let captured = builder(&FakeTransport::from_soroswap_snapshot())
+            .capture(soroswap_scenario)
+            .unwrap();
+        let mut bundle = captured.to_bundle().unwrap();
+        let (_, (_, live_until)) = bundle
+            .ledger_snapshot
+            .ledger_entries
+            .iter_mut()
+            .find(|(_, (entry, _))| matches!(entry.data, LedgerEntryData::ContractData(_)))
+            .unwrap();
+        *live_until = None;
+        refresh_bundle_digests(&mut bundle);
+        assert!(matches!(
+            CapturedFixture::from_bundle(bundle, MAINNET_PASSPHRASE, ProtocolPolicy::Exact),
+            Err(CaptureError::CaptureBundleIntegrity)
+        ));
+    }
+
+    #[test]
+    fn versioned_bundle_roundtrip_preserves_v1_ledger_entry_extension() {
+        let captured = builder(&FakeTransport::from_soroswap_snapshot())
+            .capture(soroswap_scenario)
+            .unwrap();
+        let mut bundle = captured.to_bundle().unwrap();
+        let account_entry = bundle
+            .ledger_snapshot
+            .ledger_entries
+            .iter_mut()
+            .map(|(_, (entry, _))| entry.as_mut())
+            .find(|entry| matches!(entry.data, LedgerEntryData::Account(_)))
+            .unwrap();
+        let LedgerEntryData::Account(account) = &account_entry.data else {
+            unreachable!();
+        };
+        let extension = LedgerEntryExt::V1(LedgerEntryExtensionV1 {
+            sponsoring_id: SponsorshipDescriptor(Some(account.account_id.clone())),
+            ext: LedgerEntryExtensionV1Ext::V0,
+        });
+        account_entry.ext = extension.clone();
+        refresh_bundle_digests(&mut bundle);
+
+        let loaded =
+            CapturedFixture::from_bundle(bundle, MAINNET_PASSPHRASE, ProtocolPolicy::Exact)
+                .unwrap();
+        let loaded_extension = loaded
+            .frozen_fixture()
+            .ledger_snapshot()
+            .ledger_entries
+            .iter()
+            .map(|(_, (entry, _))| entry.as_ref())
+            .find(|entry| matches!(entry.data, LedgerEntryData::Account(_)))
+            .unwrap()
+            .ext
+            .clone();
+        assert_eq!(loaded_extension, extension);
+    }
+
+    #[test]
+    fn write_only_and_confirmed_missing_keys_are_sealed_but_other_unknowns_fail_replay() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let missing = data_key(contract.clone(), 777);
+        let write_only = data_key(contract.clone(), 778);
+        let written_entry = contract_data_entry(contract, 778, 42);
+        let scenario = |env: &Env| {
+            assert!(env
+                .host()
+                .get_ledger_entry(&Rc::new(missing.clone()))
+                .unwrap()
+                .is_none());
+            env.host()
+                .add_ledger_entry(
+                    &Rc::new(write_only.clone()),
+                    &Rc::new(written_entry.clone()),
+                    Some(env.ledger().sequence() + 100),
+                )
+                .unwrap();
+        };
+
+        let captured = builder(&fake).capture(scenario).unwrap();
+        let absent: BTreeSet<Vec<u8>> = captured.known_absent_keys().map(<[u8]>::to_vec).collect();
+        assert!(absent.contains(&key_id(&missing).unwrap()));
+        assert!(absent.contains(&key_id(&write_only).unwrap()));
+
+        let unknown = data_key(parse_legacy_contract_address(PAIR_ID).unwrap(), 779);
+        let error = captured
+            .replay(|env| {
+                let _ = env.host().get_ledger_entry(&Rc::new(unknown));
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureError::UnknownLedgerKeys { count: 1 }
+        ));
+    }
+
+    #[test]
+    fn coherent_materialization_batches_at_200_and_retries_the_whole_attempt() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        fake.mix_second_large_batch_once.set(true);
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let keys: Vec<LedgerKey> = (1_000..1_401)
+            .map(|index| data_key(contract.clone(), index))
+            .collect();
+
+        let captured = builder(&fake)
+            .capture(|env| {
+                for key in &keys {
+                    assert!(env
+                        .host()
+                        .get_ledger_entry(&Rc::new(key.clone()))
+                        .unwrap()
+                        .is_none());
+                }
+            })
+            .unwrap();
+
+        let calls = fake.batch_calls.borrow();
+        assert!(calls.iter().all(|batch| batch.len() <= MAX_KEYS_PER_BATCH));
+        let large: Vec<_> = calls
+            .iter()
+            .filter(|batch| batch.len() == MAX_KEYS_PER_BATCH)
+            .collect();
+        assert!(large.len() >= 4);
+        assert!(fake.mixed_once.get());
+        let first_batch_key = &large[0][0];
+        assert!(
+            large
+                .iter()
+                .filter(|batch| batch.contains(first_batch_key))
+                .count()
+                >= 2
+        );
+        assert!(captured.report().absent_entries() >= 401);
+    }
+
+    #[test]
+    fn terminal_panic_returns_opaque_error_and_transport_failure_is_not_absence() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let panic_error = builder(&fake)
+            .capture(|_| panic!("scenario-payload-must-not-leak"))
+            .unwrap_err();
+        let rendered = format!("{panic_error:?} {panic_error}");
+        assert!(matches!(panic_error, CaptureError::ScenarioPanicked));
+        assert!(!rendered.contains("scenario-payload-must-not-leak"));
+
+        let failed_key = data_key(parse_legacy_contract_address(PAIR_ID).unwrap(), 888);
+        fake.fail_keys
+            .borrow_mut()
+            .insert(key_id(&failed_key).unwrap());
+        let transport_error = builder(&fake)
+            .capture(|env| {
+                let _ = env.host().get_ledger_entry(&Rc::new(failed_key.clone()));
+            })
+            .unwrap_err();
+        assert!(matches!(transport_error, CaptureError::Transport { .. }));
+    }
+
+    #[test]
+    fn generated_client_transport_panic_returns_the_capture_failure() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let failed_key = contract_instance_key(contract);
+        let failed_id = key_id(&failed_key).unwrap();
+        fake.fail_keys.borrow_mut().insert(failed_id.clone());
+
+        let error = builder(&fake)
+            .capture(|env| {
+                let pair_id = Address::from_str(env, PAIR_ID);
+                let _ = local_wrapper::Client::new(env, &pair_id).token_0();
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CaptureError::Transport {
+                operation: "getLedgerEntries"
+            }
+        ));
+        assert_eq!(
+            fake.batch_calls
+                .borrow()
+                .iter()
+                .filter(|keys| keys.contains(&failed_id))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn read_rpc_retries_transient_statuses_with_short_backoff() {
+        let mut responses = VecDeque::from([
+            Err(http_status_error(429, Some("0"))),
+            Err(http_status_error(503, None)),
+            Ok(ureq::Response::new(200, "OK", "{}").unwrap()),
+        ]);
+        let mut delays = Vec::new();
+
+        let response = send_read_rpc_with_retry(
+            || responses.pop_front().expect("one response per attempt"),
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            delays,
+            [Duration::from_millis(200), Duration::from_millis(400)]
+        );
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn read_rpc_retry_budget_is_bounded_and_non_retryable_statuses_fail_fast() {
+        let attempts = Cell::new(0_u32);
+        let mut delays = Vec::new();
+        let exhausted = send_read_rpc_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(http_status_error(500, None))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap_err();
+
+        assert!(matches!(*exhausted, ureq::Error::Status(500, _)));
+        assert_eq!(attempts.get(), 4);
+        assert_eq!(
+            delays,
+            [
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(800)
+            ]
+        );
+
+        let attempts = Cell::new(0_u32);
+        let mut delays = Vec::new();
+        let rejected = send_read_rpc_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(http_status_error(400, None))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap_err();
+
+        assert!(matches!(*rejected, ureq::Error::Status(400, _)));
+        assert_eq!(attempts.get(), 1);
+        assert!(delays.is_empty());
+    }
+
+    #[test]
+    fn read_rpc_honors_bounded_numeric_retry_after() {
+        let mut responses = VecDeque::from([
+            Err(http_status_error(429, Some("1"))),
+            Ok(ureq::Response::new(200, "OK", "{}").unwrap()),
+        ]);
+        let mut delays = Vec::new();
+
+        send_read_rpc_with_retry(
+            || responses.pop_front().expect("one response per attempt"),
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(delays, [Duration::from_secs(1)]);
+
+        let attempts = Cell::new(0_u32);
+        let mut delays = Vec::new();
+        let rejected = send_read_rpc_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(http_status_error(429, Some("6")))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap_err();
+
+        assert!(matches!(*rejected, ureq::Error::Status(429, _)));
+        assert_eq!(attempts.get(), 1);
+        assert!(delays.is_empty());
+    }
+
+    #[test]
+    fn request_rate_limiter_spaces_requests_and_can_be_disabled() {
+        let limiter = RequestRateLimiter::new(5);
+        let start = std::time::Instant::now();
+
+        assert_eq!(limiter.reserve_delay(start), Duration::ZERO);
+        assert_eq!(
+            limiter.reserve_delay(start + Duration::from_millis(50)),
+            Duration::from_millis(150)
+        );
+        assert_eq!(
+            limiter.reserve_delay(start + Duration::from_millis(400)),
+            Duration::ZERO
+        );
+
+        limiter.set_requests_per_second(0);
+        assert_eq!(limiter.reserve_delay(start), Duration::ZERO);
+        assert_eq!(limiter.reserve_delay(start), Duration::ZERO);
+    }
+
+    #[test]
+    fn tracking_source_latches_transport_failure_without_refetching() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let failed_key = data_key(parse_legacy_contract_address(PAIR_ID).unwrap(), 889);
+        fake.fail_keys
+            .borrow_mut()
+            .insert(key_id(&failed_key).unwrap());
+        let source = TrackingSource::rpc_with_local(
+            BTreeMap::new(),
+            fake.clone(),
+            Rc::new(LocalLedger::default()),
+            SUPPORTED_PROTOCOL_VERSION,
+        );
+        let failed_key = Rc::new(failed_key);
+
+        assert!(source.get(&failed_key).is_err());
+        assert!(source.get(&failed_key).is_err());
+
+        assert_eq!(fake.ledger_entry_reads(), 1);
+        assert_eq!(
+            source.take_failure(),
+            Some(TransportFailure::rpc("getLedgerEntries"))
+        );
+    }
+
+    fn http_status_error(status: u16, retry_after: Option<&str>) -> ureq::Error {
+        let retry_after = retry_after
+            .map(|value| format!("Retry-After: {value}\r\n"))
+            .unwrap_or_default();
+        let raw = format!("HTTP/1.1 {status} Test\r\n{retry_after}\r\n");
+        ureq::Error::Status(status, raw.parse().unwrap())
+    }
+
+    #[test]
+    fn rpc_origin_discards_userinfo_path_query_and_fragment() {
+        let origin = redact_rpc_origin(
+            "https://user:secret@rpc.example.test:8443/private?token=secret#fragment",
+        )
+        .unwrap();
+        assert_eq!(origin, "https://rpc.example.test:8443");
+    }
+
+    #[test]
+    fn testnet_builder_uses_testnet_identity_and_redacts_rpc_origin() {
+        let builder = CaptureBuilder::testnet(
+            "https://user:secret@testnet-rpc.example.test/private?token=secret",
+        )
+        .unwrap();
+
+        assert_eq!(builder.network_passphrase, TESTNET_PASSPHRASE);
+        assert_eq!(builder.rpc_origin, "https://testnet-rpc.example.test");
+        let rendered = format!("{builder:?}");
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("private"));
+    }
+
+    #[test]
+    fn capture_fails_closed_when_provider_network_differs_from_selected_network() {
+        let fake = FakeTransport::from_soroswap_snapshot();
+        let error = CaptureBuilder::with_transport(fake, TESTNET_PASSPHRASE)
+            .capture(|_| {})
+            .unwrap_err();
+
+        assert!(matches!(error, CaptureError::NetworkMismatch));
+    }
+
+    #[test]
+    fn newer_protocol_capture_requires_the_opt_in_and_keeps_the_network_protocol() {
+        let newer = SUPPORTED_PROTOCOL_VERSION + 1;
+        let fake = FakeTransport::from_soroswap_snapshot_at(newer);
+
+        let error = builder(&fake).capture(soroswap_scenario).unwrap_err();
+        assert!(is_unsupported_capture(&error, newer));
+        assert_eq!(fake.ledger_entry_reads(), 0);
+
+        let captured = builder(&fake)
+            .allow_newer_protocol()
+            .capture(|env| {
+                assert_eq!(host_protocol(env), SUPPORTED_PROTOCOL_VERSION);
+                soroswap_scenario(env);
+            })
+            .unwrap();
+        assert_eq!(captured.provenance().protocol_version(), newer);
+        assert_eq!(
+            captured.provenance().executed_protocol_version(),
+            SUPPORTED_PROTOCOL_VERSION
+        );
+        let fixture = captured.frozen_fixture();
+        assert_eq!(fixture.ledger_snapshot().protocol_version, newer);
+        assert_eq!(
+            fixture.executed_protocol_version(),
+            SUPPORTED_PROTOCOL_VERSION
+        );
+        let mut executed_header = fixture.ledger_snapshot().clone();
+        executed_header.protocol_version = SUPPORTED_PROTOCOL_VERSION;
+        assert_ne!(
+            fixture.ledger_digest(),
+            crate::canonical_ledger_digest(&executed_header).unwrap(),
+            "the ledger digest must cover the real network protocol"
+        );
+
+        let path = test_bundle_path("newer-protocol");
+        captured.write_file(&path).unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(document["ledger_snapshot"]["protocol_version"], newer);
+        assert_eq!(document["provenance"]["protocol_version"], newer);
+
+        let error = CapturedFixture::from_file(&path, MAINNET_PASSPHRASE).unwrap_err();
+        assert!(is_unsupported_fixture(&error, newer));
+        let loaded =
+            CapturedFixture::from_file_allowing_newer_protocol(&path, MAINNET_PASSPHRASE).unwrap();
+        assert_eq!(loaded.provenance(), captured.provenance());
+        assert_eq!(loaded.report(), captured.report());
+        assert_eq!(
+            fixture.ledger_digest(),
+            loaded.frozen_fixture().ledger_digest()
+        );
+
+        let reads_before = fake.ledger_entry_reads();
+        let executed = loaded
+            .replay(|env| {
+                soroswap_scenario(env);
+                host_protocol(env)
+            })
+            .unwrap();
+        assert_eq!(executed, SUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(fake.ledger_entry_reads(), reads_before);
+
+        let fork = loaded.fork();
+        assert_eq!(fork.network_protocol_version(), newer);
+        assert_eq!(fork.executed_protocol_version(), SUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(fork.ledger_digest().unwrap(), fixture.ledger_digest());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn newer_protocol_opt_in_still_rejects_older_and_two_ahead_networks() {
+        for found in [
+            SUPPORTED_PROTOCOL_VERSION - 1,
+            SUPPORTED_PROTOCOL_VERSION + 2,
+        ] {
+            let fake = FakeTransport::from_soroswap_snapshot_at(found);
+            let error = builder(&fake)
+                .allow_newer_protocol()
+                .capture(|_| {})
+                .unwrap_err();
+            assert!(is_unsupported_capture(&error, found));
+            assert_eq!(fake.ledger_entry_reads(), 0);
+        }
+
+        // The anchor of a coherent materialization is checked independently
+        // of getNetwork.
+        let mut fake = FakeTransport::from_soroswap_snapshot_at(SUPPORTED_PROTOCOL_VERSION + 1);
+        Rc::get_mut(&mut fake).unwrap().anchor.protocol_version = SUPPORTED_PROTOCOL_VERSION + 2;
+        let error = builder(&fake)
+            .allow_newer_protocol()
+            .capture(|_| {})
+            .unwrap_err();
+        assert!(is_unsupported_capture(
+            &error,
+            SUPPORTED_PROTOCOL_VERSION + 2
+        ));
+        assert_eq!(fake.ledger_entry_reads(), 0);
+    }
+
+    #[test]
+    fn newer_protocol_capture_decodes_a_header_in_the_known_format() {
+        let newer = SUPPORTED_PROTOCOL_VERSION + 1;
+        let mut fake = FakeTransport::from_soroswap_snapshot_at(newer);
+        let wire = latest_wire(&fake.anchor, &encoded_header(&fake.anchor));
+        let ledger_hash = wire.id.clone();
+        Rc::get_mut(&mut fake).unwrap().latest_wire = Some(wire);
+
+        let captured = builder(&fake)
+            .allow_newer_protocol()
+            .capture(soroswap_scenario)
+            .unwrap();
+
+        assert_eq!(captured.provenance().protocol_version(), newer);
+        assert_eq!(captured.provenance().ledger_hash(), ledger_hash);
+    }
+
+    #[test]
+    fn undecodable_header_on_a_newer_protocol_is_unsupported_not_a_transport_failure() {
+        let newer = SUPPORTED_PROTOCOL_VERSION + 1;
+        let mut fake = FakeTransport::from_soroswap_snapshot_at(newer);
+        let wire = latest_wire(&fake.anchor, &header_with_unknown_value_type(&fake.anchor));
+        Rc::get_mut(&mut fake).unwrap().latest_wire = Some(wire);
+
+        let error = builder(&fake)
+            .allow_newer_protocol()
+            .capture(|_| {})
+            .unwrap_err();
+        assert!(is_unsupported_capture(&error, newer));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "ledger protocol {newer} is not supported by this Kanatoko release (Host \
+                 protocol {SUPPORTED_PROTOCOL_VERSION}); use the Kanatoko release line for \
+                 protocol {newer}"
+            )
+        );
+        assert_eq!(fake.ledger_entry_reads(), 0);
+
+        // The anchor probe of an online cache hit reads the same header.
+        let error = builder(&fake)
+            .allow_newer_protocol()
+            .current_anchor()
+            .unwrap_err();
+        assert!(is_unsupported_capture(&error, newer));
+
+        // Without the opt-in, getNetwork already rejects the protocol.
+        let latest_reads = fake.latest_reads.get();
+        let error = builder(&fake).capture(|_| {}).unwrap_err();
+        assert!(is_unsupported_capture(&error, newer));
+        assert_eq!(fake.latest_reads.get(), latest_reads);
+    }
+
+    #[test]
+    fn undecodable_header_at_the_supported_protocol_stays_a_transport_failure() {
+        let mut fake = FakeTransport::from_soroswap_snapshot();
+        let wire = latest_wire(&fake.anchor, &header_with_unknown_value_type(&fake.anchor));
+        Rc::get_mut(&mut fake).unwrap().latest_wire = Some(wire);
+
+        for capture_builder in [builder(&fake), builder(&fake).allow_newer_protocol()] {
+            let error = capture_builder.capture(|_| {}).unwrap_err();
+            assert!(matches!(
+                error,
+                CaptureError::Transport {
+                    operation: "getLatestLedger"
+                }
+            ));
+        }
+        assert_eq!(fake.ledger_entry_reads(), 0);
+    }
+
+    #[test]
+    fn undecodable_entry_on_a_newer_protocol_is_unsupported_not_a_transport_failure() {
+        let instance = contract_instance_key(parse_legacy_contract_address(PAIR_ID).unwrap());
+        let instance_id = key_id(&instance).unwrap();
+        let keys = BTreeMap::from([(instance_id.clone(), instance)]);
+        let scenario = |env: &Env| {
+            let pair_id = Address::from_str(env, PAIR_ID);
+            let _ = local_wrapper::Client::new(env, &pair_id).token_0();
+        };
+
+        let newer = SUPPORTED_PROTOCOL_VERSION + 1;
+        let fake = FakeTransport::from_soroswap_snapshot_at(newer);
+        fake.undecodable_keys
+            .borrow_mut()
+            .insert(instance_id.clone());
+        let newer_builder = builder(&fake).allow_newer_protocol();
+        // Discovery reads a new key on its own; a coherent reload reads known
+        // keys in batches.
+        let error = newer_builder.capture(scenario).unwrap_err();
+        assert!(is_unsupported_capture(&error, newer));
+        let error = newer_builder
+            .materialize(&keys)
+            .err()
+            .expect("the batch must fail");
+        assert!(is_unsupported_capture(&error, newer));
+
+        let fake = FakeTransport::from_soroswap_snapshot();
+        fake.undecodable_keys.borrow_mut().insert(instance_id);
+        let error = builder(&fake).capture(scenario).unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureError::Transport {
+                operation: "getLedgerEntries"
+            }
+        ));
+        let error = builder(&fake)
+            .materialize(&keys)
+            .err()
+            .expect("the batch must fail");
+        assert!(matches!(
+            error,
+            CaptureError::Transport {
+                operation: "getLedgerEntries"
+            }
+        ));
+    }
+
+    /// `headerXdr` of public testnet ledger 5657882, returned by
+    /// `getLatestLedger` with `protocolVersion` 30 on 2026-11-10. Protocol 30
+    /// headers carry a `STELLAR_VALUE_SIGNED_MS` (3) `StellarValue` extension,
+    /// which the Protocol 29 XDR does not define.
+    #[cfg(kanatoko_protocol_29_fixtures)]
+    const TESTNET_PROTOCOL_30_HEADER_XDR: &str = concat!(
+        "AAAAHszw4xR0/jNC9tVqF0guigrH+J24QNzPdel9WDuDz1vd75HE2DpFf7c4ahTXB4BsrW8y5cSmcJPj",
+        "Xs4H6oBpVPQAAAAAavMLXQAAAAAAAAADAAABocVkY4gAAAAAqCTNGLyddQZNKZpbW6ykO8OqLzJpOBU9",
+        "jC+btctt8DMAAABAsYGuGB0x1V/uFgUbkQHQify33OdBDup4grd02zVXr9uh5vMyAeeX+UIXD6NPqnLp",
+        "Z+ouxcYeX1mqKNd02iA4C3hIicENyRDgdcXLxVL/zCzTrSiHoR8+tpU+NNbXRd/n6fPxwAOI+rxkN7v+",
+        "eEwtf5D+v0io0r6FGSxxsUzXVlQAVlUaDeC2s6dkAAAAACzrw716CwAAAAAAAAAAAA6bGwAAAGQATEtA",
+        "AAAAyOgrisRbvMPZK7K2Cu4BQpcqRrCdQ3RDrjlp/KKL5gHM71dLFXVLVvIyM6FvhcSzKdUnhAuEaOP5",
+        "9ptDsDga5i7bVkb0iUhY5FZ/a/deTviW8dvnAC13F74tI+gnC2SZCETAaAz0AcKXg+0YuEt37ZCofX9O",
+        "hI4/zMdPViWaDD1oAAAAAA==",
+    );
+
+    #[cfg(kanatoko_protocol_29_fixtures)]
+    #[test]
+    fn protocol_30_testnet_header_is_reported_as_unsupported_on_the_29_line() {
+        let header = BASE64.decode(TESTNET_PROTOCOL_30_HEADER_XDR).unwrap();
+        assert!(LedgerHeader::from_xdr(header, Limits::none()).is_err());
+        let wire = LatestWire {
+            id: "e81bd86da345fac7818deb11af0686f2b772f1e7ad43b5417baaba1c62cd6341".to_string(),
+            protocol_version: 30,
+            sequence: 5_657_882,
+            close_time: "1794313053".to_string(),
+            header_xdr: TESTNET_PROTOCOL_30_HEADER_XDR.to_string(),
+        };
+        let mut fake = FakeTransport::from_soroswap_snapshot_at(30);
+        Rc::get_mut(&mut fake).unwrap().latest_wire = Some(wire);
+
+        let error = builder(&fake)
+            .allow_newer_protocol()
+            .capture(|_| {})
+            .unwrap_err();
+
+        assert!(is_unsupported_capture(&error, 30));
+        assert_eq!(
+            error.to_string(),
+            "ledger protocol 30 is not supported by this Kanatoko release (Host protocol 29); \
+             use the Kanatoko release line for protocol 30"
+        );
+        assert_eq!(fake.ledger_entry_reads(), 0);
+    }
+
+    #[test]
+    fn newer_protocol_bundle_two_ahead_is_rejected_even_with_the_opt_in() {
+        let newer = SUPPORTED_PROTOCOL_VERSION + 1;
+        let fake = FakeTransport::from_soroswap_snapshot_at(newer);
+        let captured = builder(&fake)
+            .allow_newer_protocol()
+            .capture(soroswap_scenario)
+            .unwrap();
+        let mut bundle = captured.to_bundle().unwrap();
+        let two_ahead = SUPPORTED_PROTOCOL_VERSION + 2;
+        bundle.ledger_snapshot.protocol_version = two_ahead;
+        bundle.provenance.protocol_version = two_ahead;
+        refresh_bundle_digests(&mut bundle);
+        let path = test_bundle_path("newer-protocol-two-ahead");
+        fs::write(&path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
+
+        for loaded in [
+            CapturedFixture::from_file(&path, MAINNET_PASSPHRASE),
+            CapturedFixture::from_file_allowing_newer_protocol(&path, MAINNET_PASSPHRASE),
+        ] {
+            assert!(is_unsupported_fixture(&loaded.unwrap_err(), two_ahead));
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The newer-protocol mode downgrades only the ledger protocol. A contract
+    /// built for the newer interface version is still refused by the Host.
+    #[test]
+    fn newer_protocol_strict_fork_still_refuses_a_newer_interface_contract() {
+        let newer = SUPPORTED_PROTOCOL_VERSION + 1;
+        let fake = FakeTransport::from_soroswap_snapshot_at(newer);
+        let captured = builder(&fake)
+            .allow_newer_protocol()
+            .capture(soroswap_scenario)
+            .unwrap();
+        let mut fork = captured.fork();
+        assert_eq!(fork.network_protocol_version(), newer);
+        assert_eq!(fork.executed_protocol_version(), SUPPORTED_PROTOCOL_VERSION);
+        let before = fork.ledger_digest().unwrap();
+        let candidate = ScAddress::Contract(ContractId(Hash([0x6f; 32])));
+
+        let newer_interface = with_interface_protocol(local_stateful::WASM, newer);
+        let error = fork
+            .register_candidate(
+                candidate.clone(),
+                &newer_interface,
+                Sha256::digest(&newer_interface).into(),
+                vec![ScVal::I64(41)],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::StrictForkError::CandidateRegistrationFailed
+        ));
+        assert_eq!(fork.ledger_digest().unwrap(), before);
+
+        // The unpatched contract, built for an interface version the Host
+        // supports, installs on the same downgraded fork.
+        fork.register_candidate(
+            candidate,
+            local_stateful::WASM,
+            Sha256::digest(local_stateful::WASM).into(),
+            vec![ScVal::I64(41)],
+        )
+        .unwrap();
+        assert_eq!(fork.network_protocol_version(), newer);
+    }
+
+    /// Rewrites the `contractenvmetav0` interface protocol of a Soroban WASM.
+    fn with_interface_protocol(wasm: &[u8], protocol: u32) -> Vec<u8> {
+        const SECTION: &[u8] = b"contractenvmetav0";
+        let start = wasm
+            .windows(SECTION.len())
+            .position(|window| window == SECTION)
+            .expect("Soroban WASM must carry contract env metadata")
+            + SECTION.len();
+        // ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion { protocol, pre_release }.
+        assert_eq!(&wasm[start..start + 4], &[0; 4]);
+        let current = u32::from_be_bytes(wasm[start + 4..start + 8].try_into().unwrap());
+        assert!(current <= SUPPORTED_PROTOCOL_VERSION);
+        let mut patched = wasm.to_vec();
+        patched[start + 4..start + 8].copy_from_slice(&protocol.to_be_bytes());
+        patched
+    }
+
+    #[test]
+    fn auto_runner_newer_protocol_opt_in_covers_capture_cache_and_anchor_probe() {
+        use crate::{
+            auto::{AutoRunError, AutoRunner, CacheStatus, PreviewAuth},
+            AppliedAuthMode,
+        };
+
+        let newer = SUPPORTED_PROTOCOL_VERSION + 1;
+        let mut fake = FakeTransport::from_soroswap_snapshot_at(newer);
+        let path = test_bundle_path("auto-runner-newer-protocol");
+        let scenario = |fork: &crate::auto::ScenarioFork<'_>| {
+            assert_eq!(fork.network_protocol_version(), newer);
+            assert_eq!(fork.executed_protocol_version(), SUPPORTED_PROTOCOL_VERSION);
+            assert_eq!(host_protocol(fork.env()), SUPPORTED_PROTOCOL_VERSION);
+            let pair = fork.contract(PAIR_ID);
+            let report = fork
+                .preview(&pair, "token_0", (), PreviewAuth::Record)
+                .unwrap();
+            assert_eq!(
+                report.receipt().auth_mode,
+                AppliedAuthMode::RecordMockSatisfied
+            );
+            assert_eq!(report.network_protocol_version(), newer);
+            assert_eq!(
+                report.executed_protocol_version(),
+                SUPPORTED_PROTOCOL_VERSION
+            );
+            mixed_auto_scenario(fork);
+        };
+
+        let error = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(scenario)
+            .err()
+            .expect("the runner must fail closed");
+        assert!(
+            matches!(&error, AutoRunError::Capture(error) if is_unsupported_capture(error, newer))
+        );
+        assert!(!path.exists());
+
+        let created = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .allow_newer_protocol()
+            .cache(&path)
+            .run(scenario)
+            .unwrap();
+        assert_eq!(created.cache_status(), CacheStatus::Created);
+        assert_eq!(created.fixture().provenance().protocol_version(), newer);
+        assert_eq!(
+            created.fixture().provenance().executed_protocol_version(),
+            SUPPORTED_PROTOCOL_VERSION
+        );
+
+        let error = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .offline()
+            .run(scenario)
+            .err()
+            .expect("the runner must fail closed");
+        assert!(
+            matches!(&error, AutoRunError::Capture(error) if is_unsupported_fixture(error, newer))
+        );
+        let reads_before = fake.ledger_entry_reads();
+        let hit = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .allow_newer_protocol()
+            .cache(&path)
+            .offline()
+            .run(scenario)
+            .unwrap();
+        assert_eq!(hit.cache_status(), CacheStatus::Hit);
+        let online_hit = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .allow_newer_protocol()
+            .cache(&path)
+            .run(scenario)
+            .unwrap();
+        assert_eq!(online_hit.cache_status(), CacheStatus::Hit);
+        assert_eq!(fake.ledger_entry_reads(), reads_before);
+
+        // The online cache-hit probe still rejects an anchor two ahead.
+        Rc::get_mut(&mut fake).unwrap().anchor.protocol_version = SUPPORTED_PROTOCOL_VERSION + 2;
+        let error = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .allow_newer_protocol()
+            .cache(&path)
+            .run(scenario)
+            .err()
+            .expect("the runner must fail closed");
+        assert!(matches!(
+            &error,
+            AutoRunError::Capture(error)
+                if is_unsupported_capture(error, SUPPORTED_PROTOCOL_VERSION + 2)
+        ));
+        assert_eq!(fake.ledger_entry_reads(), reads_before);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rpc_wire_preserves_v1_extension_and_rejects_missing_or_malformed_extension() {
+        let snapshot = captured_snapshot();
+        let account_entry = snapshot
+            .ledger_entries
+            .iter()
+            .map(|(_, (entry, _))| entry.as_ref())
+            .find(|entry| matches!(entry.data, LedgerEntryData::Account(_)))
+            .unwrap();
+        let LedgerEntryData::Account(account) = &account_entry.data else {
+            unreachable!();
+        };
+        let extension = LedgerEntryExt::V1(LedgerEntryExtensionV1 {
+            sponsoring_id: SponsorshipDescriptor(Some(account.account_id.clone())),
+            ext: LedgerEntryExtensionV1Ext::V0,
+        });
+        let wire = EntryWire {
+            key: BASE64.encode(account_entry.to_key().to_xdr(Limits::none()).unwrap()),
+            xdr: BASE64.encode(account_entry.data.to_xdr(Limits::none()).unwrap()),
+            last_modified_ledger_seq: account_entry.last_modified_ledger_seq,
+            live_until_ledger_seq: None,
+            ext_xdr: Some(BASE64.encode(extension.to_xdr(Limits::none()).unwrap())),
+        };
+
+        let decoded = decode_wire_entry(wire, "getLedgerEntries").unwrap();
+        assert_eq!(decoded.entry.ext, extension);
+
+        let missing = EntryWire {
+            key: BASE64.encode(account_entry.to_key().to_xdr(Limits::none()).unwrap()),
+            xdr: BASE64.encode(account_entry.data.to_xdr(Limits::none()).unwrap()),
+            last_modified_ledger_seq: account_entry.last_modified_ledger_seq,
+            live_until_ledger_seq: None,
+            ext_xdr: None,
+        };
+        assert!(decode_wire_entry(missing, "getLedgerEntries").is_err());
+
+        let malformed = EntryWire {
+            key: BASE64.encode(account_entry.to_key().to_xdr(Limits::none()).unwrap()),
+            xdr: BASE64.encode(account_entry.data.to_xdr(Limits::none()).unwrap()),
+            last_modified_ledger_seq: account_entry.last_modified_ledger_seq,
+            live_until_ledger_seq: None,
+            ext_xdr: Some("not-base64".to_string()),
+        };
+        assert!(decode_wire_entry(malformed, "getLedgerEntries").is_err());
+    }
+
+    #[test]
+    fn ledger_metadata_validation_covers_live_archived_and_classic_entries() {
+        let sequence = 100;
+        let max_entry_ttl = 20;
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let mut persistent = contract_data_entry(contract, 1, 1);
+        persistent.last_modified_ledger_seq = sequence;
+
+        assert!(validate_entry_metadata(
+            &persistent,
+            Some(0),
+            sequence,
+            max_entry_ttl
+        ));
+        assert!(validate_entry_metadata(
+            &persistent,
+            Some(sequence),
+            sequence,
+            max_entry_ttl
+        ));
+        assert!(validate_entry_metadata(
+            &persistent,
+            Some(sequence + max_entry_ttl - 1),
+            sequence,
+            max_entry_ttl
+        ));
+        assert!(!validate_entry_metadata(
+            &persistent,
+            None,
+            sequence,
+            max_entry_ttl
+        ));
+        assert!(!validate_entry_metadata(
+            &persistent,
+            Some(sequence - 1),
+            sequence,
+            max_entry_ttl
+        ));
+        assert!(!validate_entry_metadata(
+            &persistent,
+            Some(sequence + max_entry_ttl),
+            sequence,
+            max_entry_ttl
+        ));
+
+        let mut temporary = persistent.clone();
+        let LedgerEntryData::ContractData(data) = &mut temporary.data else {
+            unreachable!();
+        };
+        data.durability = ContractDataDurability::Temporary;
+        assert!(!validate_entry_metadata(
+            &temporary,
+            Some(0),
+            sequence,
+            max_entry_ttl
+        ));
+        assert!(validate_entry_metadata(
+            &temporary,
+            Some(sequence),
+            sequence,
+            max_entry_ttl
+        ));
+
+        let snapshot = captured_snapshot();
+        let account = snapshot
+            .ledger_entries
+            .iter()
+            .map(|(_, (entry, _))| entry.as_ref())
+            .find(|entry| matches!(entry.data, LedgerEntryData::Account(_)))
+            .unwrap();
+        assert!(validate_entry_metadata(
+            account,
+            None,
+            snapshot.sequence_number,
+            snapshot.max_entry_ttl
+        ));
+        assert!(!validate_entry_metadata(
+            account,
+            Some(0),
+            snapshot.sequence_number,
+            snapshot.max_entry_ttl
+        ));
+
+        persistent.last_modified_ledger_seq = sequence + 1;
+        assert!(!validate_entry_metadata(
+            &persistent,
+            Some(sequence),
+            sequence,
+            max_entry_ttl
+        ));
+    }
+
+    fn usdc_to_xlm_path(env: &Env) -> soroban_sdk::Vec<Address> {
+        soroban_sdk::vec![
+            env,
+            Address::from_str(env, USDC_ID),
+            Address::from_str(env, XLM_ID)
+        ]
+    }
+
+    fn soroswap_scenario(env: &Env) {
+        let router_id = Address::from_str(env, ROUTER_ID);
+        let pair_id = Address::from_str(env, PAIR_ID);
+        let router = local_wrapper::Client::new(env, &router_id);
+        let pair = local_wrapper::Client::new(env, &pair_id);
+        let usdc = pair.token_1();
+        assert_eq!(usdc, Address::from_str(env, USDC_ID));
+        let path = usdc_to_xlm_path(env);
+        let quote_before = router
+            .router_get_amounts_out(&ONE_USDC, &path)
+            .get(1)
+            .unwrap();
+        let (_, usdc_reserve) = pair.get_reserves();
+        let amount = usdc_reserve / 10;
+        let user =
+            Address::try_from_val(env, &ScAddress::Contract(Hash([0x4b; 32]).into())).unwrap();
+
+        env.mock_all_auths();
+        StellarAssetClient::new(env, &usdc).mint(&user, &amount);
+        env.set_auths(&[]);
+        let transfer = MockAuthInvoke {
+            contract: &usdc,
+            fn_name: "transfer",
+            args: (user.clone(), pair_id.clone(), amount).into_val(env),
+            sub_invokes: &[],
+        };
+        let children = [transfer];
+        let swap = MockAuthInvoke {
+            contract: &router_id,
+            fn_name: "swap_exact_tokens_for_tokens",
+            args: (amount, 0_i128, path.clone(), user.clone(), DEADLINE).into_val(env),
+            sub_invokes: &children,
+        };
+        router
+            .mock_auths(&[MockAuth {
+                address: &user,
+                invoke: &swap,
+            }])
+            .swap_exact_tokens_for_tokens(&amount, &0, &path, &user, &DEADLINE);
+        assert!(
+            router
+                .router_get_amounts_out(&ONE_USDC, &path)
+                .get(1)
+                .unwrap()
+                < quote_before
+        );
+    }
+
+    fn mixed_auto_scenario(fork: &crate::auto::ScenarioFork<'_>) {
+        mixed_auto_scenario_for_user(fork, "swap-user");
+    }
+
+    fn mixed_auto_scenario_for_user(fork: &crate::auto::ScenarioFork<'_>, user_label: &str) {
+        let env = fork.env();
+        let user = fork.local_account(user_label);
+        fork.fund_local_account(&user, 100_000_000);
+        let router_id = fork.contract(ROUTER_ID);
+        let pair_id = fork.contract(PAIR_ID);
+        let usdc = fork.contract(USDC_ID);
+        let router = local_wrapper::Client::new(env, &router_id);
+        let pair = local_wrapper::Client::new(env, &pair_id);
+        assert!(matches!(ScAddress::from(&user), ScAddress::Account(_)));
+
+        assert_eq!(pair.token_1(), usdc);
+        let path = usdc_to_xlm_path(env);
+        let before = router
+            .router_get_amounts_out(&ONE_USDC, &path)
+            .get(1)
+            .unwrap();
+        let (_, usdc_reserve) = pair.get_reserves();
+        let amount = usdc_reserve / 10;
+
+        fork.mock_all_auths();
+        let admin = fork.invoke::<Address>(&usdc, "admin", ());
+        fork.invoke::<()>(&usdc, "trust", (user.clone(),));
+        assert_eq!(fork.local_account(user_label), user);
+        fork.invoke::<()>(&usdc, "set_authorized", (user.clone(), true));
+        fork.invoke::<()>(&usdc, "mint", (user.clone(), amount));
+        assert_eq!(env.auths()[0].0, admin);
+        let amounts = fork.invoke::<soroban_sdk::Vec<i128>>(
+            &router_id,
+            "swap_exact_tokens_for_tokens",
+            (amount, 0_i128, path.clone(), user, DEADLINE),
+        );
+        assert!(amounts.get(1).unwrap() > 0);
+
+        let after = router
+            .router_get_amounts_out(&ONE_USDC, &path)
+            .get(1)
+            .unwrap();
+        assert!(after < before);
+    }
+
+    fn test_bundle_path(label: &str) -> PathBuf {
+        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "kanatoko-{label}-{}-{sequence}.capture.json",
+            std::process::id()
+        ))
+    }
+
+    fn refresh_bundle_digests(bundle: &mut CaptureBundleV2) {
+        // Digest the snapshot directly so tests can also seal bundles at
+        // protocols the selected Host rejects.
+        let ledger = crate::canonical_ledger_digest(&bundle.ledger_snapshot).unwrap();
+        let coverage = bundle_coverage(&bundle.ledger_snapshot, &bundle.known_absent).unwrap();
+        let inventory = inventory_digest(&coverage).unwrap();
+        bundle.ledger_digest = hex(ledger);
+        bundle.inventory_digest = hex(inventory);
+        bundle.canonical_digest = hex(canonical_bundle_digest(
+            &bundle.known_absent,
+            &bundle.report,
+            &bundle.provenance,
+            &ledger,
+            &inventory,
+        )
+        .unwrap());
+    }
+
+    fn host_protocol(env: &Env) -> u32 {
+        env.host()
+            .with_ledger_info(|ledger| Ok(ledger.protocol_version))
+            .unwrap()
+    }
+
+    fn is_unsupported_capture(error: &CaptureError, expected: u32) -> bool {
+        matches!(
+            error,
+            CaptureError::UnsupportedProtocol { found, supported }
+                if *found == expected && *supported == SUPPORTED_PROTOCOL_VERSION
+        )
+    }
+
+    fn is_unsupported_fixture(error: &CaptureError, expected: u32) -> bool {
+        matches!(
+            error,
+            CaptureError::Fixture(FixtureError::UnsupportedProtocol { found, supported })
+                if *found == expected && *supported == SUPPORTED_PROTOCOL_VERSION
+        )
+    }
+
+    fn builder(fake: &Rc<FakeTransport>) -> CaptureBuilder {
+        CaptureBuilder::with_transport(fake.clone(), MAINNET_PASSPHRASE)
+    }
+
+    /// A `getLatestLedger` answer for `header_xdr` that agrees with `anchor`
+    /// on every field the decoder cross-checks.
+    fn latest_wire(anchor: &Anchor, header_xdr: &[u8]) -> LatestWire {
+        LatestWire {
+            id: hex(Sha256::digest(header_xdr)),
+            protocol_version: anchor.protocol_version,
+            sequence: anchor.sequence,
+            close_time: anchor.timestamp.to_string(),
+            header_xdr: BASE64.encode(header_xdr),
+        }
+    }
+
+    /// A ledger header in the format this release decodes.
+    fn encoded_header(anchor: &Anchor) -> Vec<u8> {
+        LedgerHeader {
+            ledger_version: anchor.protocol_version,
+            ledger_seq: anchor.sequence,
+            scp_value: StellarValue {
+                close_time: TimePoint(anchor.timestamp),
+                ..StellarValue::default()
+            },
+            base_reserve: anchor.base_reserve,
+            ..LedgerHeader::default()
+        }
+        .to_xdr(Limits::none())
+        .unwrap()
+    }
+
+    /// A ledger header whose `StellarValue` extension uses a type this
+    /// release does not define, as a newer protocol can add one.
+    fn header_with_unknown_value_type(anchor: &Anchor) -> Vec<u8> {
+        // ledgerVersion (4), previousLedgerHash (32), then StellarValue:
+        // txSetHash (32), closeTime (8), empty upgrades (4), ext type (4).
+        const EXT_TYPE: std::ops::Range<usize> = 80..84;
+        let mut header = encoded_header(anchor);
+        assert_eq!(header[EXT_TYPE], [0; 4], "expected STELLAR_VALUE_BASIC");
+        header[EXT_TYPE].copy_from_slice(&i32::MAX.to_be_bytes());
+        assert!(LedgerHeader::from_xdr(header.clone(), Limits::none()).is_err());
+        header
+    }
+
+    fn data_key(contract: ScAddress, value: u32) -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract,
+            key: ScVal::U32(value),
+            durability: ContractDataDurability::Persistent,
+        })
+    }
+
+    fn contract_data_entry(contract: ScAddress, key: u32, value: u32) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                contract,
+                key: ScVal::U32(key),
+                val: ScVal::U32(value),
+                durability: ContractDataDurability::Persistent,
+                ext: ExtensionPoint::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn external_ref_transport() -> (Rc<FakeTransport>, LedgerKey, LedgerKey, LedgerKey) {
+        let mut fake = FakeTransport::from_soroswap_snapshot();
+        let fake_mut = Rc::get_mut(&mut fake).unwrap();
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let instance_key = contract_instance_key(contract);
+        let instance_id = key_id(&instance_key).unwrap();
+        let fetched = fake_mut.entries.get(&instance_id).unwrap();
+        let mut instance_entry = fetched.entry.as_ref().clone();
+        let LedgerEntryData::ContractData(instance_data) = &mut instance_entry.data else {
+            panic!("pool instance must be contract data");
+        };
+        let ScVal::ContractInstance(instance) = &mut instance_data.val else {
+            panic!("pool entry must contain a contract instance");
+        };
+        let ContractExecutable::Wasm(wasm_hash) = &instance.executable else {
+            panic!("pool fixture must use direct Wasm");
+        };
+        let wasm_hash = wasm_hash.clone();
+        let owner = ScAddress::Contract(Hash([0x91; 32]).into());
+        let tag = ScString(b"kanatoko-test".to_vec().try_into().unwrap());
+        let external_ref = ContractExecutableExternalRef {
+            executable_owner: owner.clone(),
+            tag: tag.clone(),
+        };
+        instance.executable = ContractExecutable::ExternalRef(external_ref);
+        fake_mut.entries.insert(
+            instance_id,
+            FetchedEntry {
+                entry: Rc::new(instance_entry),
+                live_until: fetched.live_until,
+            },
+        );
+
+        let reference_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: owner.clone(),
+            key: ScVal::ExecutableTag(tag.clone()),
+            durability: ContractDataDurability::Persistent,
+        });
+        let reference_entry = LedgerEntry {
+            last_modified_ledger_seq: fake_mut.anchor.sequence,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: owner,
+                key: ScVal::ExecutableTag(tag),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Bytes(wasm_hash.0.to_vec().try_into().unwrap()),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        fake_mut.entries.insert(
+            key_id(&reference_key).unwrap(),
+            FetchedEntry {
+                entry: Rc::new(reference_entry),
+                live_until: Some(fake_mut.anchor.sequence + 100),
+            },
+        );
+        let code_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: wasm_hash });
+
+        (fake, instance_key, reference_key, code_key)
+    }
+
+    fn expand_from_instance(
+        fake: &Rc<FakeTransport>,
+        instance_key: LedgerKey,
+    ) -> Result<Materialized, CaptureError> {
+        let mut keys = BTreeMap::new();
+        keys.insert(key_id(&instance_key).unwrap(), instance_key);
+        let builder = builder(fake);
+        let materialized = builder.materialize(&keys).unwrap();
+        builder.expand_code_closure(&mut keys, materialized)
+    }
+
+    fn code_hash(key: &LedgerKey) -> Hash {
+        let LedgerKey::ContractCode(code) = key else {
+            panic!("expected contract code key");
+        };
+        code.hash.clone()
+    }
+
+    fn assert_warm_refreshes_known_key(same_sequence: bool) {
+        use crate::auto::{AutoRunner, CacheStatus};
+
+        let mut fake = FakeTransport::from_soroswap_snapshot();
+        let path = test_bundle_path(if same_sequence {
+            "auto-runner-warm-refresh-hash"
+        } else {
+            "auto-runner-warm-refresh-sequence"
+        });
+        let contract = parse_legacy_contract_address(PAIR_ID).unwrap();
+        let known = data_key(contract.clone(), 879);
+        AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|fork| {
+                assert!(fork
+                    .env()
+                    .host()
+                    .get_ledger_entry(&Rc::new(known.clone()))
+                    .unwrap()
+                    .is_none());
+            })
+            .unwrap();
+
+        let known_id = key_id(&known).unwrap();
+        let fake_mut = Rc::get_mut(&mut fake).unwrap();
+        if !same_sequence {
+            fake_mut.anchor.sequence += 1;
+        }
+        fake_mut.anchor.hash = if same_sequence {
+            "same-sequence-new-hash".to_string()
+        } else {
+            "newer-ledger".to_string()
+        };
+        fake_mut.entries.insert(
+            known_id.clone(),
+            FetchedEntry {
+                entry: Rc::new(contract_data_entry(contract, 879, 42)),
+                live_until: Some(fake_mut.anchor.sequence + 100),
+            },
+        );
+        fake.batch_calls.borrow_mut().clear();
+
+        let refreshed = AutoRunner::with_builder(builder(&fake), MAINNET_PASSPHRASE)
+            .cache(&path)
+            .run(|fork| {
+                let entry = fork
+                    .env()
+                    .host()
+                    .get_ledger_entry(&Rc::new(known.clone()))
+                    .unwrap()
+                    .unwrap();
+                let LedgerEntryData::ContractData(data) = &entry.0.data else {
+                    panic!("known entry must remain contract data");
+                };
+                assert_eq!(data.val, ScVal::U32(42));
+            })
+            .unwrap();
+
+        assert_eq!(refreshed.cache_status(), CacheStatus::Refreshed);
+        assert!(fake
+            .batch_calls
+            .borrow()
+            .iter()
+            .any(|batch| batch.len() > 1 && batch.contains(&known_id)));
+        assert!(!fake
+            .batch_calls
+            .borrow()
+            .iter()
+            .any(|batch| batch == std::slice::from_ref(&known_id)));
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The ledger snapshot embedded in the committed capture, parsed directly
+    /// so it can also seed a fake transport on Hosts that reject the bundle's
+    /// own protocol.
+    fn captured_snapshot() -> LedgerSnapshot {
+        serde_json::from_slice::<CaptureBundleV2>(&fs::read(CAPTURE_PATH).unwrap())
+            .unwrap()
+            .ledger_snapshot
+    }
+
+    struct ChangingExternalRefTransport {
+        inner: Rc<FakeTransport>,
+        reference_id: KeyId,
+        generation: Cell<usize>,
+    }
+
+    impl Transport for ChangingExternalRefTransport {
+        fn network(&self) -> Result<Network, TransportFailure> {
+            self.inner.network()
+        }
+
+        fn latest_ledger(&self) -> Result<Anchor, TransportFailure> {
+            self.inner.latest_ledger()
+        }
+
+        fn ledger_entries(&self, keys: &[LedgerKey]) -> Result<EntryBatch, TransportFailure> {
+            let mut batch = self.inner.ledger_entries(keys)?;
+            if !keys
+                .iter()
+                .any(|key| key_id(key).unwrap() == self.reference_id)
+            {
+                return Ok(batch);
+            }
+
+            let generation = self.generation.get() + 1;
+            if generation > MAX_EXECUTABLE_CLOSURE_ROUNDS {
+                return Err(TransportFailure::rpc("getLedgerEntries"));
+            }
+            self.generation.set(generation);
+            let mut hash = [0_u8; 32];
+            hash[..8].copy_from_slice(&(generation as u64).to_be_bytes());
+            for fetched in &mut batch.entries {
+                if key_id(&fetched.entry.to_key()).unwrap() != self.reference_id {
+                    continue;
+                }
+                let mut entry = fetched.entry.as_ref().clone();
+                let LedgerEntryData::ContractData(data) = &mut entry.data else {
+                    panic!("reference must be contract data");
+                };
+                data.val = ScVal::Bytes(hash.to_vec().try_into().unwrap());
+                fetched.entry = Rc::new(entry);
+            }
+            Ok(batch)
+        }
+    }
+
+    struct FakeTransport {
+        network: Network,
+        anchor: Anchor,
+        /// Raw `getLatestLedger` answer decoded instead of returning `anchor`.
+        latest_wire: Option<LatestWire>,
+        entries: BTreeMap<KeyId, FetchedEntry>,
+        batch_calls: RefCell<Vec<Vec<KeyId>>>,
+        reads: Cell<u64>,
+        network_reads: Cell<u64>,
+        latest_reads: Cell<u64>,
+        fail_keys: RefCell<BTreeSet<KeyId>>,
+        /// Keys whose entry XDR this release cannot decode.
+        undecodable_keys: RefCell<BTreeSet<KeyId>>,
+        mix_second_large_batch_once: Cell<bool>,
+        large_batches_seen: Cell<usize>,
+        mixed_once: Cell<bool>,
+    }
+
+    impl FakeTransport {
+        fn from_soroswap_snapshot() -> Rc<Self> {
+            Self::from_soroswap_snapshot_at(SUPPORTED_PROTOCOL_VERSION)
+        }
+
+        fn from_soroswap_snapshot_at(protocol_version: u32) -> Rc<Self> {
+            let mut snapshot = captured_snapshot();
+            // The captured entries and WASM are useful deterministic unit
+            // inputs on other Hosts too. Set only the in-memory ledger header
+            // used by this fake transport; the committed bundle remains exact
+            // network evidence.
+            snapshot.protocol_version = protocol_version;
+            let mut entries = BTreeMap::new();
+            for (_, (entry, live_until)) in &snapshot.ledger_entries {
+                entries.insert(
+                    key_id(&entry.to_key()).unwrap(),
+                    FetchedEntry {
+                        entry: Rc::new((**entry).clone()),
+                        live_until: *live_until,
+                    },
+                );
+            }
+            let settings = StateArchivalSettings {
+                max_entry_ttl: snapshot.max_entry_ttl,
+                min_temporary_ttl: snapshot.min_temp_entry_ttl,
+                min_persistent_ttl: snapshot.min_persistent_entry_ttl,
+                persistent_rent_rate_denominator: 1,
+                temp_rent_rate_denominator: 1,
+                max_entries_to_archive: 1,
+                live_soroban_state_size_window_sample_size: 1,
+                live_soroban_state_size_window_sample_period: 1,
+                eviction_scan_size: 1,
+                starting_eviction_scan_level: 1,
+            };
+            let config = LedgerEntry {
+                last_modified_ledger_seq: snapshot.sequence_number,
+                data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)),
+                ext: LedgerEntryExt::V0,
+            };
+            entries.insert(
+                key_id(&config.to_key()).unwrap(),
+                FetchedEntry {
+                    entry: Rc::new(config),
+                    live_until: None,
+                },
+            );
+            Rc::new(Self {
+                network: Network {
+                    passphrase: MAINNET_PASSPHRASE.to_string(),
+                    protocol_version: snapshot.protocol_version,
+                },
+                anchor: Anchor {
+                    sequence: snapshot.sequence_number,
+                    hash: "fake-coherent-ledger".to_string(),
+                    protocol_version: snapshot.protocol_version,
+                    timestamp: snapshot.timestamp,
+                    base_reserve: snapshot.base_reserve,
+                },
+                latest_wire: None,
+                entries,
+                batch_calls: RefCell::new(Vec::new()),
+                reads: Cell::new(0),
+                network_reads: Cell::new(0),
+                latest_reads: Cell::new(0),
+                fail_keys: RefCell::new(BTreeSet::new()),
+                undecodable_keys: RefCell::new(BTreeSet::new()),
+                mix_second_large_batch_once: Cell::new(false),
+                large_batches_seen: Cell::new(0),
+                mixed_once: Cell::new(false),
+            })
+        }
+
+        fn ledger_entry_reads(&self) -> u64 {
+            self.reads.get()
+        }
+    }
+
+    impl Transport for FakeTransport {
+        fn network(&self) -> Result<Network, TransportFailure> {
+            self.network_reads.set(self.network_reads.get() + 1);
+            Ok(self.network.clone())
+        }
+
+        fn latest_ledger(&self) -> Result<Anchor, TransportFailure> {
+            self.latest_reads.set(self.latest_reads.get() + 1);
+            // A configured raw answer goes through the real decoder.
+            if let Some(wire) = &self.latest_wire {
+                return decode_latest_ledger(wire.clone());
+            }
+            Ok(self.anchor.clone())
+        }
+
+        fn ledger_entries(&self, keys: &[LedgerKey]) -> Result<EntryBatch, TransportFailure> {
+            self.reads.set(self.reads.get() + 1);
+            let ids: Vec<KeyId> = keys.iter().map(|key| key_id(key).unwrap()).collect();
+            self.batch_calls.borrow_mut().push(ids.clone());
+            if ids.iter().any(|id| self.fail_keys.borrow().contains(id)) {
+                return Err(TransportFailure::rpc("getLedgerEntries"));
+            }
+            if ids
+                .iter()
+                .any(|id| self.undecodable_keys.borrow().contains(id))
+            {
+                return Err(TransportFailure::undecodable_xdr("getLedgerEntries", None));
+            }
+            let mut latest_ledger = self.anchor.sequence;
+            if keys.len() == MAX_KEYS_PER_BATCH && self.mix_second_large_batch_once.get() {
+                let seen = self.large_batches_seen.get() + 1;
+                self.large_batches_seen.set(seen);
+                if seen == 2 && !self.mixed_once.replace(true) {
+                    latest_ledger += 1;
+                }
+            }
+            Ok(EntryBatch {
+                latest_ledger,
+                entries: ids
+                    .iter()
+                    .filter_map(|id| self.entries.get(id).cloned())
+                    .collect(),
+            })
+        }
+    }
+}

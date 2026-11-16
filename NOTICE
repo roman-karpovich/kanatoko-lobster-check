@@ -1,0 +1,16 @@
+Lobster deadline replay, 2026
+
+The test code is provided under GPL-3.0-only. Lobster source and WASM originate
+from https://github.com/Lobster-Protocol/stellar at
+fff3798576f423d8235cb15e2b1f02c98d681f05; the repository's GPL-3.0 license is
+included as LICENSE, and the contract sources are under upstream/lobster.
+The source-built and factory-selected binaries are
+identified by hash in README.md.
+
+Kanatoko source is vendored at revision
+46dc28854e707e8b6e423e04a3aeb347c8f6a3c6 from
+https://github.com/roman-karpovich/kanatoko. Its MIT/Apache-2.0 license files
+remain in vendor/kanatoko.
+
+Fixtures contain public Stellar ledger data and third-party contract code
+needed for offline replay. That code remains subject to its original terms.
