@@ -8,5 +8,4 @@ license = "GPL-3.0-only"
 [workspace]
 
 [dev-dependencies]
-# Exact source revision is downloaded by prepare.sh; includes the address-collision fix.
-kanatoko = { path = "vendor/kanatoko", features = ["capture"] }
+kanatoko = { version = "=29.1.2", features = ["capture"] }

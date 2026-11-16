@@ -16,8 +16,8 @@ Prerequisite: rustup with Rust 1.95.0 (`rustup toolchain install 1.95.0`).
 ```
 
 The first build can download Rust crates. Test execution always replays the
-committed captures, with no RPC fallback. Kanatoko source is vendored so the
-test does not need GitHub access. Expected: two passing tests, twice.
+committed captures, with no RPC fallback. Kanatoko 29.1.2 is installed from
+crates.io. Expected: two passing tests, twice.
 
 ## What is observed
 
@@ -56,10 +56,9 @@ failing. No loss of funds or production vulnerability is claimed.
 - The factory's persistent `SW_ROUTER` selected
   `CAG5LRYQ5JVEUI5TEID72EYOVX44TTUJT5BQR2J6J77FH65PCCFAJDDH`.
   The `.env.example` router belongs to testnet and is not used here.
-- Kanatoko: exact source revision
-  `46dc28854e707e8b6e423e04a3aeb347c8f6a3c6`, copied under `vendor/kanatoko`.
-  This includes the unreleased local-address collision fix from PR #1; it is
-  not identical to the published crate merely because its version is 29.1.1.
+- Kanatoko: the published `29.1.2` crate, pinned exactly in `Cargo.toml` and
+  by registry checksum in `Cargo.lock`. Its local-address collision fix keeps
+  a new vault from inheriting balances at an SDK counter address.
 - `fixtures/add.json`: mainnet ledger 65508083, timestamp 1794826457;
   14 present and 8 confirmed-absent keys, zero final replay RPC reads.
 - `fixtures/withdraw.json`: mainnet ledger 65508085, timestamp 1794826467;
@@ -90,4 +89,4 @@ called directly with `cargo test -- --test-threads=1`; `check.sh` deliberately
 clears that variable. A network protocol change requires a matching Host and
 new captures rather than an automatic fallback.
 
-See `NOTICE`, `LICENSE` and the vendored dependency licenses.
+See `NOTICE` and `LICENSE`. Registry dependencies retain their own licenses.

@@ -7,10 +7,9 @@ included as LICENSE, and the contract sources are under upstream/lobster.
 The source-built and factory-selected binaries are
 identified by hash in README.md.
 
-Kanatoko source is vendored at revision
-46dc28854e707e8b6e423e04a3aeb347c8f6a3c6 from
-https://github.com/roman-karpovich/kanatoko. Its MIT/Apache-2.0 license files
-remain in vendor/kanatoko.
+Kanatoko 29.1.2 is a crates.io dependency licensed under MIT OR Apache-2.0.
+Its source is available at https://github.com/roman-karpovich/kanatoko.
+No Kanatoko source is bundled in this reproduction.
 
 Fixtures contain public Stellar ledger data and third-party contract code
 needed for offline replay. That code remains subject to its original terms.
